@@ -128,7 +128,7 @@ def test_live_commands_stay_local_and_in_the_data_dir(env, capsys, monkeypatch):
         main(["setup"])
     assert g.violations == []
     out = capsys.readouterr().out
-    assert '"UserPromptSubmit"' in out and "tokentrail statusline" in out
+    assert '"UserPromptSubmit"' in out and " statusline" in out
 
 
 def test_setup_snippet_matches_the_documented_shape(env, capsys):
@@ -136,8 +136,16 @@ def test_setup_snippet_matches_the_documented_shape(env, capsys):
     text = capsys.readouterr().out
     snippet = json.loads(text[text.index("{"): text.rindex("}") + 1])
     # the command is this tokentrail, by absolute path when it can be found
+    # (on Windows the executable is tokentrail.EXE)
     assert snippet["statusLine"]["type"] == "command"
-    assert snippet["statusLine"]["command"].endswith("tokentrail statusline")
+    assert _runs_tokentrail(snippet["statusLine"]["command"], "statusline")
     [group] = snippet["hooks"]["UserPromptSubmit"]
     assert group["hooks"][0]["type"] == "command"
-    assert group["hooks"][0]["command"].endswith("tokentrail hook prompt")
+    assert _runs_tokentrail(group["hooks"][0]["command"], "hook prompt")
+
+
+def _runs_tokentrail(command: str, args: str) -> bool:
+    from pathlib import PureWindowsPath
+
+    exe, _, rest = command.rpartition(" " + args.split()[0])
+    return rest == args[len(args.split()[0]):] and PureWindowsPath(exe.strip('"')).stem.lower() == "tokentrail"
