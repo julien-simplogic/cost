@@ -10,6 +10,7 @@ from typing import Any, Optional
 from .analysis import Row, cache_events, enrich, group_tasks
 from .classify import CATEGORIES, CATEGORY_LABELS
 from .prices import PriceTable
+from .record import counter_resets, gap_shape
 from .store import Store
 
 
@@ -161,13 +162,22 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
     for c in store.checks():
         if c["session_key"] in session_keys:
             by_session.setdefault(c["session_key"], []).append(c)
-    input_ok = [k for k, cs in by_session.items() if _rows_match(cs)]
-    mismatched = []
+
+    def ic(c, side: str) -> int:
+        return c[f"{side}_input"] + c[f"{side}_cache_read"] + c[f"{side}_cache_write"]
+
+    one_sided: dict[str, set[str]] = {"counter": set(), "lines": set()}
+    input_ok, mismatched = [], []
     for k, cs in by_session.items():
-        if k in input_ok:
+        counter_only = sorted(c["model"] for c in cs if ic(c, "ours") == 0 and ic(c, "source"))
+        lines_only = sorted(c["model"] for c in cs if ic(c, "source") == 0 and ic(c, "ours"))
+        one_sided["counter"].update(counter_only)
+        one_sided["lines"].update(lines_only)
+        if _rows_match(cs):
+            input_ok.append(k)
             continue
-        src = sum(c["source_input"] + c["source_cache_read"] + c["source_cache_write"] for c in cs)
-        ours = sum(c["ours_input"] + c["ours_cache_read"] + c["ours_cache_write"] for c in cs)
+        src = sum(ic(c, "source") for c in cs)
+        ours = sum(ic(c, "ours") for c in cs)
         cov = json.loads(cs[0]["coverage"] or "{}")
         mismatched.append({
             "session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
@@ -175,31 +185,33 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
             "input_gap": ours - src,  # signed: positive = we count more than the counter
             "input_gap_pct": 100 * (ours - src) / src if src else None,
             "output_gap": sum(c["ours_output"] for c in cs) - sum(c["source_output"] for c in cs),
+            "shape": gap_shape(cov.get("gap_series") or []),
+            "counter_resets": counter_resets(cov.get("gap_series") or []),
             "calls_after_counter": cov.get("main_calls_after_counter", 0) + cov.get("subagent_calls_after_counter", 0),
             "subagent_calls_unlinked": cov.get("subagent_calls_unlinked", 0),
-            "models_counter_only": sorted(c["model"] for c in cs if c["ours_input"] + c["ours_cache_read"]
-                                          + c["ours_cache_write"] == 0 and c["source_input"] + c["source_cache_read"] + c["source_cache_write"]),
-            "models_lines_only": sorted(c["model"] for c in cs if c["source_input"] + c["source_cache_read"]
-                                        + c["source_cache_write"] == 0 and c["ours_input"] + c["ours_cache_read"] + c["ours_cache_write"]),
+            "models_counter_only": counter_only,
+            "models_lines_only": lines_only,
         })
     mismatched.sort(key=lambda m: abs(m["input_gap_pct"] or 0), reverse=True)
     all_c = [c for cs in by_session.values() for c in cs]
-
-    def side(prefix: str) -> int:
-        return sum(c[f"{prefix}_input"] + c[f"{prefix}_cache_read"] + c[f"{prefix}_cache_write"] for c in all_c)
-
-    # A duplicate or misread call makes us count MORE than Claude Code: that is a bug.
-    # Counting LESS means the counter holds usage no call line records (a tool's own
-    # model calls such as WebFetch reading a page, sub-agent output logged mid-stream).
+    # Counting MORE than Claude Code is an error whatever its shape. Counting less is
+    # usage no call line records only if the gap appeared at a few moments (hidden
+    # calls); a gap that grows at every snapshot is a counting error too.
     over = [m for m in mismatched if m["input_gap"] > 0]
+    spread = [m for m in mismatched if m["input_gap"] < 0 and m["shape"]["kind"] == "spread"]
+    unknown = [m for m in mismatched if m["input_gap"] < 0 and m["shape"]["kind"] == "unknown"]
     return {
         "sessions_in_period": len(session_keys),
         "sessions_checkable": len(by_session),
         "sessions_input_exact": len(input_ok),
         "sessions_over": len(over),
+        "sessions_spread": len(spread),
+        "sessions_shape_unknown": len(unknown),
         "sessions_under": len(mismatched) - len(over),
-        "counter_input": side("source"),
-        "lines_input": side("ours"),
+        "models_counter_only": sorted(one_sided["counter"]),
+        "models_lines_only": sorted(one_sided["lines"]),
+        "counter_input": sum(ic(c, "source") for c in all_c),
+        "lines_input": sum(ic(c, "ours") for c in all_c),
         "mismatched": mismatched,
         "source_output": sum(c["source_output"] for c in all_c),
         "ours_output_logged": sum(c["ours_output_logged"] for c in all_c),
@@ -358,21 +370,36 @@ def render(rep: dict[str, Any]) -> str:
 
 
 def verification_banner(ck: dict[str, Any]) -> str:
-    """First thing a reader sees: are these totals checked against anything, and how did it go?"""
+    """First thing a reader sees: are these totals checked, how did it go, which way are they wrong?
+
+    Hard rules: "Verified" only when every checked session matches to the token
+    AND every model is on both sides; counting more than the counter, or a gap
+    that grows at every snapshot, is a MISMATCH.
+    """
     n, k, ok = ck["sessions_in_period"], ck["sessions_checkable"], ck["sessions_input_exact"]
-    over, under = ck.get("sessions_over", 0), ck.get("sessions_under", 0)
+    over, spread = ck.get("sessions_over", 0), ck.get("sessions_spread", 0)
+    one_sided = ck.get("models_counter_only", []) + ck.get("models_lines_only", [])
     if k == 0:
-        return (f"NOT VERIFIED: none of these {n} sessions carries Claude Code's own counter "
-                "(cost-state), so nothing checks the totals below.")
+        return (f"NOT VERIFIED: none of these {n} sessions carries Claude Code's own counter (cost-state), so "
+                "nothing checks the totals below. They miss what call lines never record, so read them as a minimum.")
     if over:
         return (f"MISMATCH: in {over} of {k} checkable sessions tokentrail counts MORE input than Claude Code's "
                 "own counter, which means a counting error. Do not trust these totals; see 'How sure' at the end.")
+    if spread:
+        return (f"MISMATCH: in {spread} of {k} checkable sessions the gap with Claude Code's counter grows at "
+                "snapshot after snapshot. Hidden calls make it jump at a few moments; a steady growth means a "
+                "counting error. Do not trust these totals; see 'How sure' at the end.")
     unchecked = f"; {n - k} sessions carry no counter and are unchecked" if k < n else ""
-    if under:
+    names = (" Models seen on one side only (not compared): " + ", ".join(one_sided) + ".") if one_sided else ""
+    if ck.get("sessions_under", 0):
         pct = 100 * ck["lines_input"] / ck["counter_input"] if ck["counter_input"] else 0
-        return (f"Checked against Claude Code's counter in {k} of {n} sessions: never more than it, exact in {ok}. "
-                f"The call lines hold {pct:.1f}% of the counter's input; the rest is usage no call line records "
-                f"(see 'How sure'){unchecked}.")
+        unk = ck.get("sessions_shape_unknown", 0)
+        shape = (f" In {unk} of them a single snapshot can't tell a hidden call from an error." if unk else "")
+        return (f"Partly verified: never more than Claude Code's counter, exact in {ok} of {k} checked sessions; "
+                f"the call lines hold {pct:.1f}% of its input, the rest arrived at a few moments (calls no line "
+                f"records). The totals below are a MINIMUM.{shape}{names}{unchecked}")
+    if one_sided:
+        return f"Partly verified: totals match Claude Code's counter, but not model by model.{names}{unchecked}"
     if k < n:
         return (f"Partly verified: input matches Claude Code's own counter to the token in {k} of {n} "
                 f"sessions; the other {n - k} carry no counter and are unchecked.")
@@ -439,6 +466,17 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
             for m in ck["mismatched"][:15]:
                 pct = _fmt_pct(m["input_gap_pct"])
                 extra = []
+                if m["counter_resets"]:
+                    extra.append(f"Claude Code's counter went DOWN {m['counter_resets']} time(s): it restarted "
+                                 "counting (e.g. a resumed session), so it covers fewer calls than the file")
+                sh = m["shape"]
+                if sh["kind"] == "concentrated":
+                    extra.append(f"gap appeared between {sh['steps']} of {sh['snapshots']} snapshots (hidden calls)")
+                elif sh["kind"] == "spread":
+                    extra.append(f"GAP GROWS between {sh['steps']} of {sh['snapshots']} snapshots, "
+                                 f"over {sh.get('calls_in_steps', 0)} calls (counting error)")
+                elif sh["kind"] == "unknown":
+                    extra.append("one snapshot only: shape unknown")
                 if m["calls_after_counter"]:
                     extra.append(f"{m['calls_after_counter']} calls after the counter (not compared)")
                 if m["subagent_calls_unlinked"]:

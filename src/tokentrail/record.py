@@ -140,6 +140,37 @@ def totals_match(checks: "list[CounterCheck]") -> bool:
     return all(tot(f"source_{k}") == tot(f"ours_{k}") for k in ("input", "cache_read", "cache_write"))
 
 
+def counter_resets(series: "list[list[int]]") -> int:
+    """Snapshots where Claude Code's counter went DOWN: it restarted counting
+    (a new process on the same session file, e.g. a resumed session)."""
+    vals = [e[2] for e in series if len(e) == 3]
+    return sum(1 for a, b in zip(vals, vals[1:]) if b < a)
+
+
+def gap_shape(series: "list[list[int]]") -> dict:
+    """How a session's gap with Claude Code's counter built up, snapshot by snapshot.
+
+    series: [calls made before the snapshot, ours - counter] per cost-state snapshot.
+    concentrated: the gap appeared between at most 2 snapshots (or 90% of it did):
+                  the signature of a few hidden calls.
+    spread:       it grew between many snapshots: the signature of a counting error.
+    unknown:      a single snapshot, or no gap at all.
+    """
+    series = [[e[0], e[1] - e[2]] if len(e) == 3 else list(e) for e in series]
+    if not series or all(g == 0 for _, g in series):
+        return {"kind": "none", "steps": 0, "snapshots": len(series)}
+    if len(series) < 2:
+        return {"kind": "unknown", "steps": 0, "snapshots": 1}
+    deltas = [series[0][1]] + [b[1] - a[1] for a, b in zip(series, series[1:])]
+    calls = [series[0][0]] + [b[0] - a[0] for a, b in zip(series, series[1:])]
+    moved = [(abs(d), c) for d, c in zip(deltas, calls) if d != 0]
+    total = sum(d for d, _ in moved)
+    top2 = sum(sorted((d for d, _ in moved), reverse=True)[:2])
+    kind = "concentrated" if len(moved) <= 2 or top2 >= 0.9 * total else "spread"
+    return {"kind": kind, "steps": len(moved), "snapshots": len(series),
+            "calls_in_steps": sum(c for _, c in moved)}
+
+
 @dataclass
 class ParseStats:
     """What a collector read, what it ignored on purpose, what it could not read."""

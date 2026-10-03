@@ -575,6 +575,20 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta):
             1 for g in groups.values() if g.main_line < 0 and pos <= lines[g.key] < 1 << 60),
         "subagent_calls_unlinked": sum(1 for g in groups.values() if lines[g.key] == 1 << 60),
     }
+    # The gap's shape in time: at each counter snapshot, our input + cache over the
+    # calls made before it, minus the counter's. A hidden call makes the gap jump
+    # once; a counting error makes it grow at every snapshot.
+    in_cache = {r.turn_id: r.input_total for r in records}
+    series = []
+    for p, u in checkpoints:
+        before = [k for k, ln in lines.items() if ln < p]
+        ours_p = sum(in_cache.get(k, 0) for k in before)
+        src_p = sum((_int(m.get("inputTokens")) or 0) + (_int(m.get("cacheReadInputTokens")) or 0)
+                    + (_int(m.get("cacheCreationInputTokens")) or 0)
+                    for m in u.values() if isinstance(m, dict))
+        series.append([len(before), ours_p, src_p])
+    coverage["gap_series"] = series  # [calls before the snapshot, ours, counter] (input + cache)
+
     sums: dict[str, list[int]] = {}
     for r in records:
         if r.turn_id in covered:

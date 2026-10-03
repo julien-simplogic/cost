@@ -6,15 +6,21 @@ output can be pasted into a bug report.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 from .collectors import claude_code
 from .errors import TokentrailError
-from .record import totals_match
+from .record import counter_resets, gap_shape, totals_match
 
 
 def run(root: Path, prefix: str) -> str:
-    hits = [sf for sf in claude_code.discover(root) if sf.session_id.startswith(prefix)]
+    sessions = claude_code.discover(root)
+    hits = [sf for sf in sessions if sf.session_id.startswith(prefix)]
+    if not hits:  # ids from `report --anonymize` are hashes of the real ones
+        hits = [sf for sf in sessions
+                if hashlib.sha256(sf.session_id.encode()).hexdigest().startswith(prefix)]
     if not hits:
         raise TokentrailError(f"No session id starts with {prefix!r}.", "Session ids are shown by `tokentrail report`.")
     if len(hits) > 1:
@@ -37,6 +43,10 @@ def run(root: Path, prefix: str) -> str:
     subs = [r for r in res.records if r.trigger == "subagent"]
     out.append(f"  calls: {len(main)} main, {len(subs)} sub-agent "
                f"({sum(1 for r in subs if not r.output_exact)} sub-agent calls logged mid-stream)")
+    others = _other_files_with_this_id(sf)
+    if others:
+        out.append(f"  {len(others)} other session file(s) in this project carry this session's id "
+                   f"({', '.join(others[:5])}{', ...' if len(others) > 5 else ''})")
     if not res.checks:
         out.append("  no cost-state counter in this session: nothing to compare with")
         return "\n".join(out)
@@ -58,4 +68,41 @@ def run(root: Path, prefix: str) -> str:
             out.append(f"  {c.model[:34]:34}{label:13}{src:>14,}{ours:>14,}{ours - src:>+16,}")
     verdict = "match" if totals_match(res.checks) else "MISMATCH"
     out.append(f"  input + cache summed over models: {verdict}")
+    series = cov.get("gap_series") or []
+    if series:
+        out.append("")
+        out.append("  at each counter snapshot (input + cache, all models):")
+        out.append(f"  {'#':>4}{'calls before':>14}{'ours':>18}{'counter':>18}{'ours - counter':>18}")
+        prev = None
+        for i, (calls, ours, src) in enumerate(series, 1):
+            note = "   <- counter went DOWN: Claude Code restarted counting" if prev is not None and src < prev else ""
+            out.append(f"  {i:>4}{calls:>14,}{ours:>18,}{src:>18,}{ours - src:>+18,}{note}")
+            prev = src
+        sh = gap_shape(series)
+        out.append(f"  gap shape: {sh['kind']}"
+                   + (f" (moved between {sh['steps']} of {sh['snapshots']} snapshots)" if sh.get("steps") else "")
+                   + f"; counter restarts: {counter_resets(series)}")
     return "\n".join(out)
+
+
+def _other_files_with_this_id(sf: claude_code.SessionFiles) -> list[str]:
+    """Session files of the same project whose first records carry this session's id."""
+    if not sf.main:
+        return []
+    found = []
+    for f in sorted(sf.main.parent.glob("*.jsonl")):
+        if f == sf.main:
+            continue
+        try:
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                for _, line in zip(range(30), fh):
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("sessionId") == sf.session_id:
+                        found.append(f.stem[:8])
+                        break
+        except OSError:
+            continue
+    return found

@@ -93,7 +93,13 @@ message.id" ratio, on your data. For the model that wrote the conversation,
 one line per `message.id` gives exactly Claude Code's own input and cache
 counts.
 
-**A second finding: the counter holds more than the lines.** Here, Haiku is
+## Second trap: the transcript is a floor, not a total
+
+**Any tool that calls a model internally creates usage that Claude Code
+counts and the transcript never records.** The session above shows it with
+`WebFetch`, and the same holds for every tool built this way.
+
+Here, Haiku is
 144,670 tokens short. That is the session's two `WebFetch` calls. The tool has
 a small model read each fetched page, Claude Code counts that call, and no
 call line records it (the tool's result carries only bytes and a duration). So
@@ -103,6 +109,28 @@ call line records. tokentrail tells these two cases apart in every report and
 shows the unattributed part separately, instead of hiding it or spreading it
 over categories it can't be assigned to. `tokentrail diagnose <session>` gives
 the per-model detail.
+
+Read every total built from the transcript as a **minimum**. Before this
+check, you could read a total without knowing in which direction it was
+wrong. Known mechanisms only remove usage from the lines: tools' own model
+calls, and sub-agent output written mid-stream. Counting *more* than the
+counter is never explained by them, so tokentrail treats it as an error.
+
+How tokentrail turns this into a verdict, on the first line of every report:
+
+- **Verified**: every checked session matches Claude Code's counter to the
+  token, *and* every model appears on both sides. If a model appears on one
+  side only, the verdict is at best "Partly verified", and the model is named.
+  (On one machine the counter said `claude-opus-5[1m]` where the call lines
+  said `claude-opus-5`. An earlier version of the check skipped that model
+  silently and could have reported a match while ignoring most of the volume.)
+- **MISMATCH** when tokentrail counts more than the counter, or when the gap
+  grows snapshot after snapshot. Claude Code writes its counter at the end of
+  each turn. A hidden call makes the gap jump between one or two snapshots; a
+  counting error makes it grow at every one. Each disagreeing session shows
+  its gap with sign, size and shape. When the counter goes *down* between two
+  snapshots, Claude Code restarted counting, and the report says so.
+- Otherwise "Partly verified", with the totals flagged as a minimum.
 
 **What it does not prove.** That Claude Code's counter equals what you are
 billed: it is Claude Code's number, not Anthropic's invoice. Sub-agent output
