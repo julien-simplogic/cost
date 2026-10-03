@@ -236,7 +236,15 @@ def parse_since(spec: Optional[str], now: Optional[datetime] = None) -> Optional
     if spec[-1:] in units and spec[:-1].isdigit():
         dt = now - timedelta(**{units[spec[-1]]: int(spec[:-1])})
     else:
-        dt = datetime.fromisoformat(spec)
+        try:
+            dt = datetime.fromisoformat(spec)
+        except ValueError:
+            from .errors import TokentrailError
+
+            raise TokentrailError(
+                f"Can't read the date {spec!r}.",
+                "Use 7d, 24h, 2w, 'all', or a date like 2026-09-01.",
+            ) from None
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")

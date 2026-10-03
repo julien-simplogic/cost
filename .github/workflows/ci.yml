@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +24,7 @@ jobs:
       - name: tests (incl. no-network and write-only-in-data-dir guarantees)
         run: python -m pytest -q
       - name: demo runs on invented data
+        shell: bash
         run: python scripts/demo.py > /dev/null
       - name: CLI entry point
         run: tokentrail --version

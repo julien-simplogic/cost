@@ -256,6 +256,7 @@ def render(rep: dict[str, Any]) -> str:
     if period["project"]:
         span += f", projects matching '{period['project']}'"
     out.append(f"tokentrail report: {span}")
+    out.append(verification_banner(rep["checks"]))
     out.append(
         f"{t['sessions']} sessions, {t['tasks']} tasks, {t['turns']} model calls, "
         f"{fmt_tokens(t['tokens'])} tokens, {fmt_cost(t['cost'])} at API prices"
@@ -312,6 +313,21 @@ def render(rep: dict[str, Any]) -> str:
     out.append("")
     out += _render_trust(rep)
     return "\n".join(out)
+
+
+def verification_banner(ck: dict[str, Any]) -> str:
+    """First thing a reader sees: are these totals checked against anything?"""
+    n, k, ok = ck["sessions_in_period"], ck["sessions_checkable"], ck["sessions_input_exact"]
+    if k == 0:
+        return (f"NOT VERIFIED: none of these {n} sessions carries Claude Code's own counter "
+                "(cost-state), so nothing checks the totals below.")
+    if ok < k:
+        return (f"MISMATCH: in {k - ok} of {k} checkable sessions, input does not match Claude Code's "
+                "own counter. Do not trust these totals; see 'How sure' at the end.")
+    if k < n:
+        return (f"Partly verified: input matches Claude Code's own counter to the token in {k} of {n} "
+                f"sessions; the other {n - k} carry no counter and are unchecked.")
+    return f"Verified: input matches Claude Code's own counter to the token in all {n} sessions."
 
 
 def _render_trust(rep: dict[str, Any]) -> list[str]:

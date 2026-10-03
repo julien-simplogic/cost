@@ -19,7 +19,8 @@ token counts.
 {"type":"assistant","message":{"id":"msg_A","content":[{"type":"tool_use","name":"Bash",...}],"usage":{"input_tokens":2,"cache_read_input_tokens":27925,"cache_creation_input_tokens":19280,"output_tokens":210}}}
 ```
 
-Any tool that sums `usage` over the lines is off by a factor of two to three, and
+Any tool that sums `usage` over the lines is off by a factor of about 2.4 to 3.2
+(measured below; it depends on how many blocks your calls have), and
 anyone redoing this work will fall into the same trap. **The fix:** group
 records by `message.id` (falling back to `requestId`) and count each call once.
 
@@ -37,9 +38,45 @@ from the per-block lines, and it is written into the same transcript as
 
 tokentrail matches the counter **to the token**, at each of the three
 checkpoints the session wrote. It runs this comparison on every session that
-has a counter, and prints the result at the end of every report
-([below](#how-sure-are-these-numbers)). `tokentrail check` gives it per Claude
-Code version.
+has a counter: the first line of every report says whether the totals are
+verified, partly verified, or not verified at all. `tokentrail check` gives it
+per Claude Code version.
+
+### Check it yourself, in 30 seconds
+
+You don't have to believe this README, or even tokentrail's code.
+`scripts/verify_dedup.py` is one file of standard-library Python, about 100
+lines, and it does not import tokentrail. It reads your transcripts and writes
+nothing. For every session that carries Claude Code's counter, it compares
+three totals over the same calls: the counter, the naive sum of every line,
+and one line per `message.id`.
+
+```
+git clone <this repository> tokentrail
+python3 tokentrail/scripts/verify_dedup.py            # or: ... verify_dedup.py <projects folder>
+```
+
+On the session this tool was built in (Claude Code 2.1.288), it prints:
+
+```
+1 sessions under ~/.claude/projects; 1 carry Claude Code's counter (cost-state).
+                                     input      cache read     cache write        output
+Claude Code's counter                  230      25,290,661         388,268       170,375
+naive sum of every line                576      65,286,318         922,826       491,227
+one line per message.id                230      25,290,661         388,268       170,072
+naive / counter                      2.50x           2.58x           2.38x         2.88x
+Sessions where 'one line per message.id' equals the counter for input and cache: 1 of 1.
+```
+
+**What this proves.** Summing the lines overcounts by the ratio shown, on your
+data. Keeping one line per `message.id` gives exactly Claude Code's own input
+and cache counts.
+
+**What it does not prove.** That Claude Code's counter equals what you are
+billed: it is Claude Code's number, not Anthropic's invoice. Output also
+differs slightly (here 170,072 vs 170,375): sub-agent output is under-logged,
+[see below](#how-sure-are-these-numbers). If your Claude Code version writes
+no counter, the script says so, and nothing can be checked.
 
 ## Why
 
@@ -178,6 +215,58 @@ The most useful part is often the warnings:
 | large context | every further turn re-reads it; `/compact` or a fresh session resets it |
 | sub-agent heavy | ≥ 30% of this family's tokens historically went to sub-agents |
 
+## Live display, while you work
+
+```
+tokentrail setup        # prints the lines to add to ~/.claude/settings.json; edits nothing
+```
+
+**Status line.** Claude Code runs it after each reply and shows its one line
+under the prompt:
+
+```
+tokentrail | ctx 34% | cache 98% | $13.63 (incl. recovered) | counter ok
+```
+
+Context used, the session's cache-read share, its cost at API prices, and
+whether its input matches Claude Code's own counter. The last field reads
+`counter ok`, `COUNTER MISMATCH` or `unverified`, and the line never pretends.
+It reads the session's own transcript, so it needs no history and takes about
+0.15 s on a 1.3 MB session.
+
+**Prompt hook (`UserPromptSubmit`).** When you send a prompt, it shows the
+estimate and the warnings:
+
+```
+tokentrail: next call 430,797 tokens in (429,141 cached), floor $0.099; this task p10-p90 $0.230-$7.11 (all 10 past tasks, too few 'review' ones)
+  ! Large context (431k): every further turn re-reads it (~$0.086 per turn from cache, 27 turns at p90). /compact or a fresh session resets it.
+```
+
+Built on Claude Code's documented interface (code.claude.com/docs/en/hooks
+and /statusline), read before writing it:
+
+- **The hook only answers with `systemMessage`, which is shown to you.** Plain
+  output from a `UserPromptSubmit` hook is added to the model's context: that
+  would make every prompt cost more, so tokentrail never prints any.
+- **It never blocks or slows a prompt.** It always exits 0. On any error it
+  prints nothing. The suggested timeout is 10 s, against a default of 30. It
+  reads only the current session, and predictions use whatever history
+  `tokentrail ingest` stored before.
+- **The status line always prints one line**, even on garbage input.
+
+Limits:
+
+- **Cloud sessions.** In a cloud session the status line and the hook see
+  that session's transcript only, not your local history. Heavy work done
+  locally is fully visible. If you move that work to cloud sessions, the
+  display becomes partial. Whether the status line is shown in the web and
+  mobile apps is not documented. The hooks page says hooks run in cloud
+  sessions, but I could not confirm it for `UserPromptSubmit` specifically.
+- **Not yet watched in a real terminal.** Both commands are tested on
+  invented transcripts and were run on a real 2.1.288 transcript with the
+  documented JSON. They have not yet been observed inside an interactive
+  Claude Code terminal.
+
 ## Install
 
 Python 3.11 or newer, no dependencies.
@@ -188,6 +277,25 @@ cd tokentrail
 pipx install .        # or: python -m pip install .
 ```
 
+## When something is missing or broken
+
+tokentrail never shows a traceback. Each case below gets a message that says
+what to do next, and each has a test with its own fixture
+(`tests/test_robustness.py`):
+
+| Situation | What you get |
+|---|---|
+| no `~/.claude/projects`, or nothing in it | where it looked; `CLAUDE_CONFIG_DIR` / `--source-dir`; a pointer to the cloud-session limit |
+| sessions with no model call yet, or an empty period | what was read, and the dates your history covers |
+| a Claude Code version that writes no counter | the report's **first line** says `NOT VERIFIED` (or `Partly verified` with counts) |
+| a cut-off last line (session killed or still running) | everything before it is read; the line is counted as `truncated_last_line` |
+| bad bytes, unreadable files | counted under "not understood", by reason and by Claude Code version |
+| Windows paths and consoles | project names from `C:\...` working directories; characters a console can't show are replaced, not fatal |
+| bad `--since`, broken price file, corrupt database, data folder not writable | what is wrong and the one thing to do |
+| anything else | a one-line message; `--debug` shows the details |
+
+CI runs the tests on Linux, macOS and Windows.
+
 ## Use
 
 ```
@@ -196,6 +304,7 @@ tokentrail report --since 2w --project shop --top 20
 tokentrail report --since all --json
 tokentrail report --logged-only         # output exactly as each call's own line logged it
 tokentrail check                        # per Claude Code version and per month: what to trust
+tokentrail setup                        # the settings.json lines for the live display
 tokentrail estimate "add retries to the payment client"
 tokentrail estimate --file prompt.md --add src/payments.py --family refactor
 tokentrail tag 3df37995 review          # declare a past task's family

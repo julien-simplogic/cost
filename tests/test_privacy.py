@@ -101,8 +101,8 @@ def test_write_guard_sees_the_tools_own_writes(env):
     """With the data dir *not* allowed, the guard must flag tokentrail's database."""
     _populate(env.projects)
     with guarded([env.tmp / "elsewhere"]) as g:
-        with pytest.raises(RuntimeError):
-            main(["ingest"])
+        code = main(["ingest"])  # the CLI turns the guard's exception into a message
+    assert code != 0
     assert any("tokentrail" in v for v in g.violations), g.violations
 
 

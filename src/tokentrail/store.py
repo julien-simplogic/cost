@@ -220,6 +220,13 @@ class Store:
             args.append(session_key)
         return self.db.execute(q + " ORDER BY ts, rowid", args).fetchall()
 
+    def has_records(self) -> bool:
+        return self.db.execute("SELECT 1 FROM records LIMIT 1").fetchone() is not None
+
+    def time_span(self) -> tuple[str, str]:
+        row = self.db.execute("SELECT MIN(ts), MAX(ts) FROM records").fetchone()
+        return (row[0] or "", row[1] or "")
+
     def tasks(self) -> dict[tuple[str, str], dict]:
         out = {}
         for r in self.db.execute(

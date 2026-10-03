@@ -26,7 +26,7 @@ ALLOWED_EMAILS = re.compile(
     re.IGNORECASE,
 )
 ALLOWED_DOMAINS = {
-    "github.com", "claude.com", "claude.ai", "code.claude.com", "anthropic.com", "docs.anthropic.com",
+    "github.com", "githubusercontent.com", "claude.com", "claude.ai", "code.claude.com", "anthropic.com", "docs.anthropic.com",
     "python.org", "docs.python.org", "peps.python.org", "pypi.org", "opensource.org",
     "example.com", "example.org", "keepachangelog.com", "semver.org", "pipx.pypa.io",
 }

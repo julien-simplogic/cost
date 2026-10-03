@@ -43,6 +43,7 @@ class FakeSession:
         self.prompt_id: Optional[str] = None
         self.subagents: dict[str, tuple[list[str], dict]] = {}
         self.last_call_at = start
+        self.true_usage: dict[str, list[int]] = {}  # per model: input, cache read, cache write, output
 
     # -------------------------------------------------------------- basics
     def tick(self, seconds: float = 5) -> None:
@@ -128,6 +129,9 @@ class FakeSession:
         }
         if stop_reason == "auto":
             stop_reason = "tool_use" if tools else "end_turn"
+        acc = self.true_usage.setdefault(model or self.model, [0, 0, 0, 0])
+        for i, v in enumerate((new, read, write, out)):
+            acc[i] += v
         blocks: list[dict] = [{"type": "thinking", "thinking": "", "signature": "x"}]
         tool_ids = []
         for name, inp in tools:
@@ -193,6 +197,14 @@ class FakeSession:
         self.emit(rec)
         self.parent = rec["uuid"]
         return agent_id
+
+    def counter(self) -> None:
+        """Write Claude Code's counter as it would be: the sums of every call so far."""
+        self.cost_state({
+            m: {"inputTokens": u[0], "cacheReadInputTokens": u[1], "cacheCreationInputTokens": u[2],
+                "outputTokens": u[3]}
+            for m, u in self.true_usage.items()
+        })
 
     def cost_state(self, model_usage: dict) -> None:
         """Claude Code's own running counter, as it writes it at the end of a turn."""

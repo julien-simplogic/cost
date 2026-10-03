@@ -71,6 +71,12 @@ class PriceTable:
         return age is None or age > STALE_AFTER_DAYS
 
 
+def _validate(data: dict) -> None:
+    for name, m in data.get("models", {}).items():
+        for key in ("input", "output", "cache_read"):
+            float(m[key])  # KeyError / ValueError name the problem
+
+
 def packaged_prices_text() -> str:
     return resources.files("tokentrail").joinpath("data/prices.toml").read_text(encoding="utf-8")
 
@@ -84,10 +90,20 @@ def load(path: Optional[Path] = None) -> PriceTable:
         text, origin = path.read_text(encoding="utf-8"), str(path)
     else:
         text, origin = packaged_prices_text(), "(packaged default)"
-    data = tomllib.loads(text)
-    verified = data.get("verified_on")
-    if isinstance(verified, str):
-        verified = date.fromisoformat(verified)
+    try:
+        data = tomllib.loads(text)
+        _validate(data)
+        verified = data.get("verified_on")
+        if isinstance(verified, str):
+            verified = date.fromisoformat(verified)
+    except (tomllib.TOMLDecodeError, KeyError, TypeError, ValueError) as e:
+        from .errors import TokentrailError
+
+        raise TokentrailError(
+            f"The price file {origin} can't be read ({e}).",
+            "Fix it, or delete it to go back to the packaged prices "
+            "(`tokentrail prices --init` makes a fresh copy).",
+        ) from e
     mult = data.get("cache_write_multiplier", {})
     models = {
         name: ModelPrice(

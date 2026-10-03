@@ -26,6 +26,7 @@ from .analysis import (
 )
 from .prices import PriceTable
 from .report import fmt_cost, fmt_tokens
+from .errors import TokentrailError
 from .store import Store
 
 DEFAULT_CHARS_PER_TOKEN = 2.5  # observed 1.8-2.7 on code and JSON with current tokenizers
@@ -63,7 +64,8 @@ def guess_family_from_text(text: str) -> Optional[str]:
     return "question" if t.strip() else None
 
 
-def _pick_session(store: Store, prefix: Optional[str], cwd: Optional[str]) -> Optional[str]:
+def _pick_session(store: Store, prefix: Optional[str], cwd: Optional[str]) -> tuple[Optional[str], str]:
+    """(session key, how it was chosen)."""
     rows = store.db.execute(
         "SELECT s.session_key, s.session_id, s.cwd, MAX(r.ts) AS last "
         "FROM sessions s JOIN records r ON r.session_key = s.session_key "
@@ -71,12 +73,17 @@ def _pick_session(store: Store, prefix: Optional[str], cwd: Optional[str]) -> Op
     ).fetchall()
     if prefix:
         hits = [r for r in rows if r["session_id"].startswith(prefix)]
-        return hits[0]["session_key"] if hits else None
+        return (hits[0]["session_key"] if hits else None), "given"
     if cwd:
+        here = _norm(cwd)
         for r in rows:
-            if r["cwd"] and os.path.realpath(r["cwd"]) == os.path.realpath(cwd):
-                return r["session_key"]
-    return rows[0]["session_key"] if rows else None
+            if r["cwd"] and _norm(r["cwd"]) == here:
+                return r["session_key"], "this directory"
+    return (rows[0]["session_key"] if rows else None), "latest"
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
 
 
 def chars_per_token(rows: list[Row]) -> tuple[float, int]:
@@ -109,13 +116,19 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     now = inp.now or datetime.now(timezone.utc)
     tasks = store.tasks()
     all_rows = enrich(store.records(), prices, tasks)
-    session_key = _pick_session(store, inp.session, inp.cwd or os.getcwd())
+    session_key, chosen = _pick_session(store, inp.session, inp.cwd or os.getcwd())
     if session_key is None:
-        return {"error": "no session found; run Claude Code first, or pass --session"}
+        if inp.session:
+            raise TokentrailError(f"No session id starts with {inp.session!r}.",
+                                  "Session ids are shown by `tokentrail report`.")
+        raise TokentrailError("No session to start from.", "Run Claude Code once, then try again.")
     srows = [r for r in all_rows if r.session_key == session_key]
     main = [r for r in srows if r.trigger != "subagent"]
     if not main:
-        return {"error": f"session {session_key} has no main-thread calls"}
+        raise TokentrailError(
+            "That session has no call of its own (only sub-agent calls), so there is no last input to start from.",
+            "Pick another session with --session.",
+        )
     last = main[-1]
     model = inp.model or last.model
     price = prices.lookup(model)
@@ -191,6 +204,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         or 32_000
     )
     max_turns = inp.max_turns or (int(max(t.turns_main for t in basis)) if basis else 1)
+    turns_basis = "given" if inp.max_turns else ("your max for this basis" if basis else "no history: pass --max-turns")
     n, m = max_turns, max_tokens
     ceil_in = n * input_next + m * n * (n - 1) // 2
     ceil_out = n * m
@@ -250,6 +264,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
 
     return {
         "session": last.session_id[:8],
+        "session_chosen": chosen,
         "project": last.project,
         "model": model,
         "computed": {
@@ -269,6 +284,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
             "family": family,
             "family_source": family_source,
             "basis": basis_label,
+            "basis_is_family": basis is fam_hist,
             "samples": len(basis),
             **({k: v for k, v in expected.items()} if expected else {}),
         },
@@ -276,7 +292,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
             "floor": {"input": input_next, "cost": floor_cost},
             "ceiling": {
                 "input": ceil_in, "output": ceil_out, "cost": ceil_cost,
-                "max_tokens": max_tokens, "max_turns": max_turns,
+                "max_tokens": max_tokens, "max_turns": max_turns, "max_turns_basis": turns_basis,
             },
         },
         "warnings": warnings,
@@ -349,10 +365,11 @@ def _ago(seconds: float) -> str:
 
 
 def render(est: dict[str, Any]) -> str:
-    if "error" in est:
-        return f"tokentrail estimate: {est['error']}"
     c, p, f = est["computed"], est["predicted"], est["frame"]
-    out = [f"tokentrail estimate: session {est['session']} ({est['project']}), {est['model']}", ""]
+    out = [f"tokentrail estimate: session {est['session']} ({est['project']}), {est['model']}"]
+    if est.get("session_chosen") == "latest":
+        out.append("  no session was started in this directory: using your most recent one (--session to pick)")
+    out.append("")
     out.append("Computed (from the session's last real call)")
     out.append(f"  last call input            {c['last_call_input']:>12,}")
     out.append(f"  + its answer               {c['last_call_output']:>12,}")
@@ -384,14 +401,17 @@ def render(est: dict[str, Any]) -> str:
         if p.get("cost"):
             out.append(f"  cost                       {_band(p['cost'], fmt_cost)}")
     else:
-        out.append("  not enough history yet")
+        out.append(
+            f"  no past task to compare with yet ({p['samples']} found). Predictions need history; "
+            "the floor and ceiling below hold regardless."
+        )
     out.append("")
     ce = f["ceiling"]
     out.append("Frame")
     out.append(f"  floor (exact)    {fmt_cost(f['floor']['cost']):>10}   the first call's input, paid whatever happens")
     out.append(
-        f"  ceiling          {fmt_cost(ce['cost']):>10}   {ce['max_turns']} turns x {ce['max_tokens']:,} max_tokens, "
-        "context re-sent each turn"
+        f"  ceiling          {fmt_cost(ce['cost']):>10}   {ce['max_turns']} turns ({ce['max_turns_basis']}) x "
+        f"{ce['max_tokens']:,} max_tokens, context re-sent each turn"
     )
     out.append("                                tool results and sub-agents have no fixed cap and are not in it")
     if est["warnings"]:

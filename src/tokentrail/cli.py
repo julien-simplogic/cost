@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import __version__, estimate, paths, prices, report
+from . import __version__, estimate, live, paths, prices, report
 from .analysis import parse_since
 from .classify import FAMILIES
 from .collectors import claude_code
+from .errors import TokentrailError, no_transcripts
 from .ingest import ingest_claude_code
 from .store import Store
+
+ISSUES_HINT = "Nothing was changed. Run again with --debug to see details, and please report it."
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -25,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"tokentrail {__version__}")
     p.add_argument("--source-dir", type=Path, help="Claude Code projects dir (default: ~/.claude/projects)")
+    p.add_argument("--debug", action="store_true", help="show full errors instead of a short message")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("ingest", help="read new or changed transcripts into the local database")
@@ -69,12 +74,19 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--init", action="store_true")
 
     sub.add_parser("where", help="show where tokentrail reads and writes")
+
+    sub.add_parser("statusline", help="Claude Code status line (reads Claude Code's JSON on stdin)")
+    s = sub.add_parser("hook", help="Claude Code hooks (read Claude Code's JSON on stdin)")
+    s.add_argument("event", choices=["prompt"], help="prompt: UserPromptSubmit")
+    sub.add_parser("setup", help="print the settings.json lines that turn on the live display")
     return p
 
 
 def _ingest(store: Store, args) -> None:
     root = args.source_dir or paths.claude_code_dir()
     res = ingest_claude_code(store, root, force=getattr(args, "force", False))
+    if res.sessions_seen == 0:
+        raise no_transcripts(root, root.is_dir())
     st = res.stats
     if args.cmd == "ingest":
         print(f"{res.sessions_seen} sessions found, {res.sessions_parsed} read (others unchanged)")
@@ -89,6 +101,12 @@ def _ingest(store: Store, args) -> None:
             f"({_fmt_counts({**st.unreadable, **{'type:' + k: v for k, v in st.unknown_types.items()}})})",
             file=sys.stderr,
         )
+        if st.unreadable.get("truncated_last_line"):
+            print(
+                f"note: {st.unreadable['truncated_last_line']} session file(s) end in a cut-off line: the session "
+                "was killed, or is still being written. Everything before that line was read.",
+                file=sys.stderr,
+            )
     newer = sorted(v for v in (st.versions if st else {}) if _vkey(v) > _vkey(claude_code.VERIFIED_VERSION))
     if newer:
         print(
@@ -108,6 +126,80 @@ def _fmt_counts(d: dict) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
+    try:
+        # never crash on a console that can't print a character (e.g. Windows cp437)
+        sys.stdout.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return _run(args)
+    except TokentrailError as e:
+        if args.debug:
+            raise
+        print(f"tokentrail: {e.message}", file=sys.stderr)
+        if e.hint:
+            print(f"  what to do: {e.hint}", file=sys.stderr)
+        return e.exit_code
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:  # noqa: BLE001 - last resort: a message, never a traceback
+        if args.debug:
+            raise
+        print(f"tokentrail: unexpected error ({type(e).__name__}: {e}).", file=sys.stderr)
+        print(f"  what to do: {ISSUES_HINT}", file=sys.stderr)
+        return 70
+
+
+def _open_store() -> Store:
+    try:
+        paths.ensure_data_dir()
+    except OSError as e:
+        raise TokentrailError(
+            f"Cannot create tokentrail's data directory {paths.data_dir()} ({e.strerror or e}).",
+            "Set TOKENTRAIL_HOME to a folder you can write to.",
+        ) from e
+    try:
+        return Store(paths.db_path())
+    except sqlite3.DatabaseError as e:
+        raise TokentrailError(
+            f"tokentrail's database {paths.db_path()} is unreadable ({e}).",
+            "Delete that file: it only holds data rebuilt from your transcripts on the next run "
+            "(families declared with `tokentrail tag` are lost).",
+        ) from e
+
+
+def _run(args) -> int:
+    if args.cmd == "statusline":
+        # must print one line whatever happens: Claude Code shows it as is
+        try:
+            print(live.statusline(sys.stdin.read()))
+        except Exception as e:  # noqa: BLE001
+            if args.debug:
+                raise
+            print(f"tokentrail: {type(e).__name__} (run `tokentrail check`)")
+        return 0
+
+    if args.cmd == "hook":
+        # never block or slow down a prompt, never write to the model's context
+        try:
+            out = live.prompt_hook(sys.stdin.read())
+        except Exception:  # noqa: BLE001
+            if args.debug:
+                raise
+            out = None
+        if out:
+            print(out)
+        return 0
+
+    if args.cmd == "setup":
+        print(f"Add this to {live.where_settings()} (merge with what is already there):\n")
+        print(live.setup_snippet())
+        print("\nThe status line runs after each reply; the hook runs when you send a prompt and shows")
+        print("its estimate to you only (systemMessage): nothing is added to the model's context.")
+        print("tokentrail never edits that file itself: it writes only to its own data directory.")
+        return 0
+
 
     if args.cmd == "where":
         print(f"reads:  {args.source_dir or paths.claude_code_dir()}")
@@ -133,8 +225,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  {name:22} in ${p.input:>6.2f}  out ${p.output:>6.2f}  cache read ${p.cache_read:.2f}  /MTok")
         return 0
 
-    paths.ensure_data_dir()
-    with Store(paths.db_path()) as store:
+    with _open_store() as store:
         if args.cmd == "tag":
             ids = store.tag(claude_code.SOURCE, args.task, args.family)
             if len(ids) == 1:
@@ -148,6 +239,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.cmd == "ingest":
             return 0
 
+        if not store.has_records():
+            raise TokentrailError(
+                "Transcripts were found but hold no model call yet (sessions Claude never answered, "
+                "or only records this version of tokentrail doesn't understand).",
+                "Use Claude Code for a bit and run this again; `tokentrail ingest` says what was read.",
+                exit_code=1,
+            )
+
         table = prices.load()
         if args.cmd == "report":
             since = None if args.since == "all" else parse_since(args.since)
@@ -156,6 +255,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 store, table, since=since, until=until, project=args.project,
                 top=args.top, anonymize=args.anonymize, logged_only=args.logged_only,
             )
+            if not rep["totals"]["turns"] and not args.json:
+                first, last = store.time_span()
+                raise TokentrailError(
+                    f"No model call in this period. Your history runs from {first[:10]} to {last[:10]}.",
+                    "Widen the period (--since all) or check --project.",
+                    exit_code=1,
+                )
             print(json.dumps(rep, indent=2) if args.json else report.render(rep))
             return 0
 
@@ -177,7 +283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 now=datetime.fromisoformat(args.now) if args.now else None,
             ))
             print(json.dumps(est, indent=2, default=str) if args.json else estimate.render(est))
-            return 1 if "error" in est else 0
+            return 0
     return 0
 
 

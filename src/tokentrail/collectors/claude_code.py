@@ -33,7 +33,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator, Optional
 
 from ..classify import guess_family
@@ -111,6 +111,13 @@ def discover(root: Path) -> list[SessionFiles]:
 # helpers
 
 
+def project_name(cwd: str) -> str:
+    """Last folder of a working directory, whichever OS wrote the transcript."""
+    if "\\" in cwd or re.match(r"^[A-Za-z]:", cwd):
+        return PureWindowsPath(cwd).name or cwd
+    return PurePosixPath(cwd).name or cwd
+
+
 def _int(v: Any) -> Optional[int]:
     if isinstance(v, bool):
         return None
@@ -160,7 +167,9 @@ def _read_jsonl(path: Path, stats: ParseStats) -> Iterator[dict]:
             try:
                 obj = json.loads(line)
             except ValueError:
-                stats.bump(stats.unreadable, "bad_json")
+                # only the last line can lack its newline: the session was killed mid-write,
+                # or is still being written
+                stats.bump(stats.unreadable, "bad_json" if line.endswith("\n") else "truncated_last_line")
                 continue
             if not isinstance(obj, dict):
                 stats.bump(stats.unreadable, "not_an_object")
@@ -428,7 +437,7 @@ def parse_session(sf: SessionFiles) -> SessionResult:
 
     # -------------------------------------------------------------- records
     records: list[UsageRecord] = []
-    project = Path(cwd).name if cwd else sf.project_dir
+    project = project_name(cwd) if cwd else sf.project_dir
     for g in sorted(groups.values(), key=lambda g: g.order):
         usage = patched.get(g.key, g.usage)
         out_logged = _int(g.usage.get("output_tokens")) or 0
@@ -472,7 +481,10 @@ def parse_session(sf: SessionFiles) -> SessionResult:
             input_cache_write_1h=cwrite_1h,
             output_source="subagent_result" if g.key in patched else "logged",
             output_logged=out_logged,
-            output_exact=g.key in patched or g.stop_reason is not None,
+            # Only sub-agent lines are known to be written mid-stream (checked against
+            # Claude Code's counter). A main-thread line without stop_reason (older
+            # versions) is not evidence of anything, so it is not flagged.
+            output_exact=not is_sub or g.key in patched or g.stop_reason is not None,
             extra={
                 "tools": [t["name"] for t in g.tool_uses],
                 "trigger_tools": trig_tools,

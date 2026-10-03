@@ -29,9 +29,11 @@ def _signature(files: list[Path]) -> str:
     return h.hexdigest()
 
 
-def ingest_claude_code(store: Store, root: Path, force: bool = False) -> IngestResult:
+def ingest_claude_code(store: Store, root: Path, force: bool = False,
+                       sessions: "list[claude_code.SessionFiles] | None" = None) -> IngestResult:
+    """sessions: only these (the live hook reads just the current session)."""
     res = IngestResult(stats=ParseStats())
-    for sf in claude_code.discover(root):
+    for sf in sessions if sessions is not None else claude_code.discover(root):
         res.sessions_seen += 1
         key = f"{claude_code.SOURCE}:{sf.project_dir}/{sf.session_id}"
         files = sf.all_files()
@@ -44,7 +46,7 @@ def ingest_claude_code(store: Store, root: Path, force: bool = False) -> IngestR
         res.stats.merge(out.stats)  # type: ignore[union-attr]
         cwd = next((t.cwd for t in out.tasks if t.cwd), None)
         project = next((r.project for r in out.records if r.project), None) or (
-            Path(cwd).name if cwd else sf.project_dir
+            claude_code.project_name(cwd) if cwd else sf.project_dir
         )
         store.replace_session(
             session_key=key,
