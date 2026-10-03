@@ -194,6 +194,11 @@ class FakeSession:
         self.parent = rec["uuid"]
         return agent_id
 
+    def cost_state(self, model_usage: dict) -> None:
+        """Claude Code's own running counter, as it writes it at the end of a turn."""
+        self.emit({"type": "cost-state", "sessionId": self.session_id, "totalCostUSD": 0.0,
+                   "modelUsage": model_usage})
+
     # -------------------------------------------------------------- output
     def write(self) -> Path:
         self.dir.mkdir(parents=True, exist_ok=True)

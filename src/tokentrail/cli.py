@@ -36,8 +36,14 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--project", help="only projects whose name contains this")
     s.add_argument("--top", type=int, default=10)
     s.add_argument("--anonymize", action="store_true", help="replace project and session names")
+    s.add_argument("--logged-only", action="store_true",
+                   help="use only each call's own log line for output (no recovered sub-agent figures)")
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-ingest", action="store_true", help="don't read transcripts first")
+
+    s = sub.add_parser("check", help="how far to trust the numbers: per Claude Code version, per month")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-ingest", action="store_true")
 
     s = sub.add_parser("estimate", help="what the next prompt will cost, before sending it")
     s.add_argument("text", nargs="*", help="the prompt you are about to send (or use --file / stdin)")
@@ -148,9 +154,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             until = parse_since(args.until) if args.until else None
             rep = report.build(
                 store, table, since=since, until=until, project=args.project,
-                top=args.top, anonymize=args.anonymize,
+                top=args.top, anonymize=args.anonymize, logged_only=args.logged_only,
             )
             print(json.dumps(rep, indent=2) if args.json else report.render(rep))
+            return 0
+
+        if args.cmd == "check":
+            chk = report.build_check(store, table)
+            print(json.dumps(chk, indent=2) if args.json else report.render_check(chk))
             return 0
 
         if args.cmd == "estimate":

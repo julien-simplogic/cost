@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -21,9 +22,10 @@ def build(
     project: Optional[str] = None,
     top: int = 10,
     anonymize: bool = False,
+    logged_only: bool = False,
 ) -> dict[str, Any]:
     tasks = store.tasks()
-    rows = enrich(store.records(since, until, project), prices, tasks)
+    rows = enrich(store.records(since, until, project), prices, tasks, logged_only)
     names = _Anonymizer(anonymize)
 
     tot_tokens = sum(r.tokens for r in rows)
@@ -35,6 +37,7 @@ def build(
         c["turns"] += 1
         c["tokens"] += r.tokens
         c["cost"] += r.cost or 0
+        c["recovered"] += r.recovered
     categories = [
         {
             "key": k,
@@ -42,6 +45,7 @@ def build(
             "turns": int(v["turns"]),
             "tokens": int(v["tokens"]),
             "cost": round(v["cost"], 4),
+            "recovered_output": int(v["recovered"]),
             "token_share": _share(v["tokens"], tot_tokens),
             "cost_share": _share(v["cost"], tot_cost),
         }
@@ -85,6 +89,7 @@ def build(
             "turns_main": t.turns_main,
             "turns_subagent": t.turns_sub,
             "tokens": t.tokens,
+            "recovered_output": t.recovered,
             "cost": round(t.cost, 4),
             "subagent_token_share": _share(t.sub_tokens, t.tokens),
         }
@@ -92,6 +97,12 @@ def build(
     ]
 
     stats = store.parse_stats()
+    recovered_rows = [r for r in rows if r.recovered]
+    recovered_cost = 0.0
+    for r in recovered_rows:
+        p = prices.lookup(r.model)
+        if p:
+            recovered_cost += r.recovered * p.output / 1e6
     return {
         "period": {"since": since, "until": until, "project": project},
         "totals": {
@@ -104,9 +115,15 @@ def build(
             "input_cache_write": sum(r.cache_write for r in rows),
             "output": sum(r.output for r in rows),
             "output_reasoning": sum(r.reasoning or 0 for r in rows),
+            "output_logged": sum(r.output_logged for r in rows),
+            "output_recovered": sum(r.recovered for r in rows),
+            "output_recovered_calls": len(recovered_rows),
+            "output_recovered_cost": round(recovered_cost, 4),
+            "logged_only": logged_only,
             "cost": round(tot_cost, 4),
             "unpriced_turns": sum(1 for r in rows if r.cost is None),
             "inexact_output_turns": sum(1 for r in rows if not r.output_exact),
+            "inexact_output_logged": sum(r.output for r in rows if not r.output_exact),
         },
         "categories": categories,
         "sessions": sessions[:top],
@@ -117,6 +134,7 @@ def build(
             "expiries": sum(1 for e in events if e.kind == "expired"),
             "expiry_cost": round(sum(e.extra_cost or 0 for e in events if e.kind == "expired"), 4),
         },
+        "checks": _checks_summary(store, {r.session_key for r in rows}, names),
         "parsing": {
             "files": stats.files,
             "records": stats.lines,
@@ -126,6 +144,7 @@ def build(
             "unreadable": stats.unreadable,
             "unknown_types": stats.unknown_types,
             "versions": stats.versions,
+            "not_understood_by_version": _not_understood_by_version(store),
         },
         "prices": {
             "file": prices.path,
@@ -133,6 +152,43 @@ def build(
             "stale": prices.is_stale(),
         },
     }
+
+
+def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") -> dict[str, Any]:
+    """Our sums vs Claude Code's own counter, for sessions in the period that have one."""
+    by_session: dict[str, list] = {}
+    for c in store.checks():
+        if c["session_key"] in session_keys:
+            by_session.setdefault(c["session_key"], []).append(c)
+    input_ok = [k for k, cs in by_session.items() if all(
+        (c["source_input"], c["source_cache_read"], c["source_cache_write"])
+        == (c["ours_input"], c["ours_cache_read"], c["ours_cache_write"]) for c in cs)]
+    mismatched = [
+        {"session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
+         "version": cs[0]["version"]}
+        for k, cs in by_session.items() if k not in input_ok
+    ]
+    all_c = [c for cs in by_session.values() for c in cs]
+    return {
+        "sessions_in_period": len(session_keys),
+        "sessions_checkable": len(by_session),
+        "sessions_input_exact": len(input_ok),
+        "mismatched": mismatched,
+        "source_output": sum(c["source_output"] for c in all_c),
+        "ours_output_logged": sum(c["ours_output_logged"] for c in all_c),
+        "ours_output": sum(c["ours_output"] for c in all_c),
+    }
+
+
+def _not_understood_by_version(store: Store) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for s in store.sessions():
+        st = json.loads(s["stats"])
+        n = sum(st.get("unreadable", {}).values()) + sum(st.get("unknown_types", {}).values())
+        if n:
+            v = s["version"] or "unknown"
+            out[v] = out.get(v, 0) + n
+    return out
 
 
 def _share(part: float, whole: float) -> float:
@@ -212,7 +268,8 @@ def render(rep: dict[str, Any]) -> str:
     out.append("")
     out.append("Where it went")
     rows = [
-        [c["label"], str(c["turns"]), fmt_tokens(c["tokens"]), f"{c['token_share']:.0f}%",
+        [c["label"], str(c["turns"]),
+         fmt_tokens(c["tokens"]) + ("\u2021" if c["recovered_output"] else " "), f"{c['token_share']:.0f}%",
          fmt_cost(c["cost"]), f"{c['cost_share']:.0f}%"]
         for c in sorted(rep["categories"], key=lambda c: c["cost"], reverse=True)
     ]
@@ -222,7 +279,8 @@ def render(rep: dict[str, Any]) -> str:
     rows = [
         [x["task"], x["project"], x["started"],
          (x["family"] or "?") + ("*" if x["family_source"] == "declared" else ""),
-         f"{x['turns']} ({x['turns_subagent']} sub)", fmt_tokens(x["tokens"]), fmt_cost(x["cost"]),
+         f"{x['turns']} ({x['turns_subagent']} sub)",
+         fmt_tokens(x["tokens"]) + ("\u2021" if x["recovered_output"] else " "), fmt_cost(x["cost"]),
          f"{x['subagent_token_share']:.0f}%"]
         for x in rep["tasks"]
     ]
@@ -231,6 +289,8 @@ def render(rep: dict[str, Any]) -> str:
         rows, {4, 5, 6, 7},
     )
     out.append("  family: guessed from the first tool calls; * = declared with `tokentrail tag`")
+    if rep["totals"]["output_recovered"]:
+        out.append("  \u2021 includes output not taken from the call's own log line (see 'How sure' below)")
     out.append("")
     out.append("By session")
     rows = [
@@ -250,23 +310,123 @@ def render(rep: dict[str, Any]) -> str:
             f"{c['breaks']} breaks (prefix changed) cost {fmt_cost(c['break_cost'])} extra"
         )
     out.append("")
-    notes = [
-        f"Read {p['files']} transcript files, {p['records']} records: {p['used']} used, "
+    out += _render_trust(rep)
+    return "\n".join(out)
+
+
+def _render_trust(rep: dict[str, Any]) -> list[str]:
+    """What the numbers above rest on. Never omitted."""
+    t, p, ck = rep["totals"], rep["parsing"], rep["checks"]
+    out = ["How sure are these numbers"]
+    out.append(
+        f"  Read {p['files']} transcript files, {p['records']} records: {p['used']} used, "
         f"{p['ignored_by_design']} skipped by design, {p['not_understood']} not understood"
-    ]
+    )
     if p["not_understood"]:
         detail = {**p["unreadable"], **{f"type:{k}": v for k, v in p["unknown_types"].items()}}
-        notes.append("  not understood: " + ", ".join(f"{k}={v}" for k, v in sorted(detail.items())))
-    if t["inexact_output_turns"]:
-        notes.append(
-            f"{t['inexact_output_turns']} sub-agent calls were logged mid-stream: their output counts "
-            "are lower bounds (input counts are exact)"
+        out.append("    not understood: " + ", ".join(f"{k}={v}" for k, v in sorted(detail.items())))
+        by_v = p.get("not_understood_by_version") or {}
+        if by_v:
+            out.append("    by Claude Code version: " + ", ".join(f"{v}={n}" for v, n in sorted(by_v.items())))
+    if t["logged_only"]:
+        out.append("  Output: as logged on each call's own line (--logged-only); nothing recovered.")
+    elif t["output_recovered"]:
+        out.append(
+            f"  \u2021 Output: {fmt_tokens(t['output_logged'])} as logged on each call's own line, plus "
+            f"{fmt_tokens(t['output_recovered'])} recovered for {t['output_recovered_calls']} sub-agent calls "
+            f"({fmt_cost(t['output_recovered_cost'])}) from the sub-agent's result in the parent transcript, "
+            "because their own line was written mid-stream. Rows marked \u2021 include them; "
+            "--logged-only leaves them out."
         )
+    if t["inexact_output_turns"]:
+        out.append(
+            f"  {t['inexact_output_turns']} sub-agent calls were logged mid-stream with nothing to recover from: "
+            f"their output ({fmt_tokens(t['inexact_output_logged'])} as logged) is a lower bound. Input is exact."
+        )
+    if ck["sessions_checkable"]:
+        gap = ck["source_output"] - ck["ours_output"]
+        out.append(
+            f"  Checked against Claude Code's own counter (cost-state records) in {ck['sessions_checkable']} of "
+            f"{ck['sessions_in_period']} sessions: input and cache match to the token in "
+            f"{ck['sessions_input_exact']}; output {fmt_tokens(ck['ours_output'])} here vs "
+            f"{fmt_tokens(ck['source_output'])} there"
+            + (f" ({fmt_tokens(gap)} not visible in the per-call lines)" if gap > 0 else "")
+            + ("" if gap > 0 else " (match)") + "."
+        )
+        for m in ck["mismatched"]:
+            out.append(f"    input mismatch: session {m['session']} ({m['project']}, Claude Code {m['version']})")
+    else:
+        out.append("  No session in this period carries Claude Code's own counter: totals are unchecked.")
     if t["unpriced_turns"]:
-        notes.append(f"{t['unpriced_turns']} calls use a model missing from the price file (cost not counted)")
+        out.append(f"  {t['unpriced_turns']} calls use a model missing from the price file (cost not counted)")
     pr = rep["prices"]
-    notes.append(f"Prices: {pr['file']}, verified {pr['verified_on'] or 'never'}")
+    out.append(f"  Prices: {pr['file']}, verified {pr['verified_on'] or 'never'}")
     if pr["stale"]:
-        notes.append("  prices are more than 60 days old: check them, then `tokentrail prices --init` to edit")
-    out += notes
+        out.append("    prices are more than 60 days old: check them, then `tokentrail prices --init` to edit")
+    return out
+
+
+# ---------------------------------------------------------------- check
+
+
+def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
+    """Everything needed to judge the numbers: per version, per month."""
+    tasks = store.tasks()
+    rows = enrich(store.records(), prices, tasks)
+    sessions = {s["session_key"]: s for s in store.sessions()}
+    checks: dict[str, list] = {}
+    for c in store.checks():
+        checks.setdefault(c["session_key"], []).append(c)
+
+    versions: dict[str, dict[str, int]] = {}
+    for key, s in sessions.items():
+        v = versions.setdefault(s["version"] or "unknown", defaultdict(int))
+        st = json.loads(s["stats"])
+        v["sessions"] += 1
+        v["records"] += st.get("lines", 0)
+        v["not_understood"] += sum(st.get("unreadable", {}).values()) + sum(st.get("unknown_types", {}).values())
+        cs = checks.get(key)
+        if cs:
+            v["checkable"] += 1
+            exact = all((c["source_input"], c["source_cache_read"], c["source_cache_write"])
+                        == (c["ours_input"], c["ours_cache_read"], c["ours_cache_write"]) for c in cs)
+            v["input_exact"] += int(exact)
+            v["output_gap"] += sum(c["source_output"] - c["ours_output"] for c in cs)
+
+    months: dict[str, dict[str, float]] = {}
+    for r in rows:
+        m = months.setdefault(r.ts[:7], defaultdict(float))
+        m["calls"] += 1
+        m["input"] += r.input_total
+        m["output"] += r.output
+        m["tokens"] += r.tokens
+        m["cost"] += r.cost or 0
+        m["recovered"] += r.recovered
+    return {
+        "versions": {k: dict(v) for k, v in sorted(versions.items())},
+        "months": {k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in sorted(months.items())},
+    }
+
+
+def render_check(chk: dict[str, Any]) -> str:
+    out = ["tokentrail check", "", "By Claude Code version"]
+    rows = [
+        [v, str(int(d.get("sessions", 0))), str(int(d.get("records", 0))), str(int(d.get("not_understood", 0))),
+         f"{int(d.get('checkable', 0))}", f"{int(d.get('input_exact', 0))}", fmt_tokens(d.get("output_gap", 0))]
+        for v, d in chk["versions"].items()
+    ]
+    out += _table(["version", "sessions", "records", "not understood", "with counter", "input exact",
+                   "output gap"], rows, {1, 2, 3, 4, 5, 6})
+    out.append("  with counter: sessions carrying Claude Code's own cost-state counter; input exact: of those,")
+    out.append("  sessions where input and cache match it to the token; output gap: output the counter has")
+    out.append("  and the per-call lines don't (sub-agent calls logged mid-stream).")
+    out.append("")
+    out.append("By month (compare with your plan's usage page)")
+    rows = [
+        [m, str(int(d["calls"])), fmt_tokens(d["input"]), fmt_tokens(d["output"]), fmt_tokens(d["tokens"]),
+         fmt_cost(d["cost"]) + ("‡" if d.get("recovered") else "")]
+        for m, d in chk["months"].items()
+    ]
+    out += _table(["month", "calls", "input", "output", "tokens", "API-price cost"], rows, {1, 2, 3, 4, 5})
+    out.append("  Sessions on this machine only: cloud sessions run on Anthropic's machines, not in these files.")
     return "\n".join(out)

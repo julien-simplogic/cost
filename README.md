@@ -6,6 +6,41 @@ A local command-line tool. It reads the session transcripts Claude Code already
 writes on your machine. No API key, no instrumentation, no network: nothing
 leaves the machine, and [that is tested](#privacy-tested-not-promised).
 
+## First, the trap: summing the transcript counts every call two to three times
+
+Claude Code writes each session as JSONL. One API call is written as **one
+record per content block**: a thinking block, a text block, each tool call.
+**Every one of those records carries the call's full `usage`.** A call that
+thinks and then makes two tool calls appears three times, with three identical
+token counts.
+
+```jsonl
+{"type":"assistant","message":{"id":"msg_A","content":[{"type":"thinking",...}],"usage":{"input_tokens":2,"cache_read_input_tokens":27925,"cache_creation_input_tokens":19280,"output_tokens":210}}}
+{"type":"assistant","message":{"id":"msg_A","content":[{"type":"tool_use","name":"Bash",...}],"usage":{"input_tokens":2,"cache_read_input_tokens":27925,"cache_creation_input_tokens":19280,"output_tokens":210}}}
+```
+
+Any tool that sums `usage` over the lines is off by a factor of two to three, and
+anyone redoing this work will fall into the same trap. **The fix:** group
+records by `message.id` (falling back to `requestId`) and count each call once.
+
+**How we know the fix is right.** Claude Code also keeps its own running
+counter. It is fed by the API's final usage, which is a different code path
+from the per-block lines, and it is written into the same transcript as
+`cost-state` records. On a real 2.1.288 session (main thread, Opus):
+
+| | input | cache read | cache write | output |
+|---|---:|---:|---:|---:|
+| Claude Code's own counter | 152 | 15,141,977 | 263,220 | 125,933 |
+| sum over transcript lines | 416 | 43,831,083 | 660,362 | 399,139 |
+| ratio | **2.7x** | **2.9x** | **2.5x** | **3.2x** |
+| tokentrail (grouped by `message.id`) | 152 | 15,141,977 | 263,220 | 125,933 |
+
+tokentrail matches the counter **to the token**, at each of the three
+checkpoints the session wrote. It runs this comparison on every session that
+has a counter, and prints the result at the end of every report
+([below](#how-sure-are-these-numbers)). `tokentrail check` gives it per Claude
+Code version.
+
 ## Why
 
 Over one real week of development with Claude Code, the author used 14 million
@@ -40,7 +75,7 @@ Where it went
 consumer            calls  tokens  share    cost  share
 ------------------  -----  ------  -----  ------  -----
 tool turns            273   14.0M    60%   $9.22    54%
-sub-agents            135    4.5M    19%   $5.01    29%
+sub-agents            135   4.5M‡    19%   $5.01    29%
 reviews & re-reads     65    3.3M    14%   $1.97    12%
 your messages          33    1.3M     6%  $0.838     5%
 
@@ -61,9 +96,12 @@ session   project       started           tasks  calls  tokens   cost  sub-agent
 f3be8698  harbor-api    2026-09-27 12:30      4     62    3.1M  $2.12         23%
 ...
 
-Read 33 transcript files, 1621 records: 1541 used, 80 skipped by design, 0 not understood
-116 sub-agent calls were logged mid-stream: their output counts are lower bounds (input counts are exact)
-Prices: (packaged default), verified 2026-09-25
+How sure are these numbers
+  Read 33 transcript files, 1621 records: 1541 used, 80 skipped by design, 0 not understood
+  ‡ Output: 275k as logged on each call's own line, plus 37k recovered for 19 sub-agent calls ($0.744) from the sub-agent's result in the parent transcript, because their own line was written mid-stream. Rows marked ‡ include them; --logged-only leaves them out.
+  116 sub-agent calls were logged mid-stream with nothing to recover from: their output (348 as logged) is a lower bound. Input is exact.
+  No session in this period carries Claude Code's own counter: totals are unchecked.
+  Prices: (packaged default), verified 2026-09-25
 ```
 
 Look at both share columns. Token share and cost share diverge because a cache
@@ -156,6 +194,8 @@ pipx install .        # or: python -m pip install .
 tokentrail report                       # last 7 days
 tokentrail report --since 2w --project shop --top 20
 tokentrail report --since all --json
+tokentrail report --logged-only         # output exactly as each call's own line logged it
+tokentrail check                        # per Claude Code version and per month: what to trust
 tokentrail estimate "add retries to the payment client"
 tokentrail estimate --file prompt.md --add src/payments.py --family refactor
 tokentrail tag 3df37995 review          # declare a past task's family
@@ -171,24 +211,52 @@ tokentrail where                        # what it reads, where it writes
 ## How it counts
 
 Claude Code writes each session as JSONL under `~/.claude/projects/` (or
-`$CLAUDE_CONFIG_DIR/projects`). A few details of that format decide whether
-the counts are right:
+`$CLAUDE_CONFIG_DIR/projects`).
 
-- **One API call, several records.** A call is written as one record per
-  content block (thinking, text, each tool call), and *each one repeats the
-  call's usage*. Summing records counts a call two or three times.
-  tokentrail groups records by message id.
-- **The task id exists.** Every user-side record carries a `promptId` that ties
-  the call back to the message you typed. Sub-agents share their parent's.
-- **Sub-agent output is logged mid-stream.** Sub-agent records are written as
-  soon as streaming starts, so their `output_tokens` is often a placeholder.
-  The final call's real usage appears in the parent's tool result, and
-  tokentrail patches it in. Earlier sub-agent calls stay flagged as lower
-  bounds, and the report says how many. Input counts are exact.
+- **One call, several records:** de-duplicated by `message.id`, as shown
+  [at the top](#first-the-trap-summing-the-transcript-counts-every-call-two-to-three-times).
+- **The task id exists.** Every user-side record carries a `promptId` that
+  ties the call back to the message you typed. Sub-agents share their parent's.
 - **Resumed sessions repeat history.** A call is counted once even if it shows
   up in two session files.
 - **Compaction** resets the context legitimately and is not reported as a cache
   break.
+
+### How sure are these numbers
+
+Every report ends with a section of that name, and it is never omitted.
+
+**Sub-agent output is undercounted in the transcripts, and tokentrail says so.**
+Sub-agent records are written as soon as streaming starts. Their
+`output_tokens` is then a placeholder (typically 1 to 3), and their
+`stop_reason` is null.
+
+*How we know.* This is not a deduction from the format alone. On the session
+above, the sub-agent (Haiku) made two calls, logged with 3 output tokens each.
+Claude Code's own counter says that model produced **309**. Its input, cache
+read and cache write match the lines to the token, so the gap is output only.
+We have no external reference: Anthropic does not document this. The evidence
+is one Claude Code number contradicting another, on calls whose lines also
+contain a tool call that cannot fit in 3 tokens.
+
+*What tokentrail does about it, visibly.*
+
+- The parent transcript holds the sub-agent's result, with the **final call's**
+  usage (219 output tokens here). tokentrail attributes it to the sub-agent's
+  last call **only if its input counts match exactly**. It keeps the logged
+  value next to it (`output_logged`) and records where the figure came from
+  (`output_source = "subagent_result"`).
+- Rows that include such figures are marked **‡**. The report says how many
+  tokens, on how many calls, and at what cost, are not from a call's own line.
+  `--logged-only` gives the report without them.
+- Earlier sub-agent calls have nothing to recover from. They stay as logged
+  and are reported as **lower bounds**.
+- The remaining gap is measured, not estimated. Where a session has Claude
+  Code's counter, the report prints its output next to ours. Here: 222 vs 309,
+  so 87 tokens are not visible in the per-call lines. No number is invented to
+  fill that gap.
+
+Input and cache counts of sub-agents are exact; the counter confirms them.
 
 ### Tolerant parsing
 
@@ -230,11 +298,13 @@ anything downstream.
 | `timestamp`, `source`, `model` | when, which collector, which model |
 | `input_total` = `input_cache_read` + `input_cache_write` + `input_new` | input tokens, split by cache status (`input_cache_write_1h` = part written with the 1-hour TTL) |
 | `output_total`, `output_reasoning` | output tokens, of which reasoning when the source reports it |
+| `output_logged`, `output_source` | what the call's own line said, and where `output_total` comes from (`logged` or `subagent_result`, marked ‡) |
 | `turn_id` | one model call |
 | `task_id` | everything one request of yours caused, sub-agents included |
 | `trigger` | `user_turn`, `tool_call` or `subagent` |
 | `duration_ms` | from the triggering record to the end of the call |
-| `session_id`, `project`, `agent_id`, `output_exact`, `extra` | optional context |
+| `output_exact` | false when logged mid-stream with nothing to recover: a lower bound |
+| `session_id`, `project`, `agent_id`, `extra` | optional context |
 
 See `src/tokentrail/record.py`.
 
@@ -272,6 +342,26 @@ tests (`tests/test_privacy.py`), run in CI on every push:
 tokentrail writes to `$TOKENTRAIL_HOME`, or by default to
 `~/.local/share/tokentrail` (`%LOCALAPPDATA%\tokentrail` on Windows). Prompt
 text is never stored, only its length.
+
+## What v0 does not see: cloud sessions
+
+Claude Code sessions run on Anthropic's machines (claude.ai/code, the mobile
+app) write their transcripts **there**, not on your computer, so a local
+tokentrail cannot see them. If you move heavy work (parallel sub-agents, full
+reviews) to cloud sessions, tokentrail goes blind exactly where you spend.
+
+Honest options, none of them complete:
+
+- **Run tokentrail inside the cloud session.** The transcript exists in that
+  session's container while it lives. You can ask for `tokentrail report` in
+  the session itself. The container is reclaimed afterwards, so this gives no
+  history.
+- **Per-session totals from Anthropic.** The cloud session record exposes
+  totals (tokens by type, API-price cost), equal to Claude Code's own counter.
+  They are readable from a cloud session's tools, not from the local CLI, and
+  carry no per-turn detail: no categories, no tasks.
+- Sessions you drive remotely but that run on your machine (for example from
+  VS Code) are local, and fully visible.
 
 ## What v0 does not do
 

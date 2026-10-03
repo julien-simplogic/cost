@@ -58,5 +58,6 @@ def ingest_claude_code(store: Store, root: Path, force: bool = False) -> IngestR
             records=out.records,
             tasks=out.tasks,
             file_events=out.file_events,
+            checks=out.checks,
         )
     return res

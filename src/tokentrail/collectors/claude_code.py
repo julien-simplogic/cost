@@ -17,10 +17,14 @@ Things the format does that matter for counting:
   ``message.id``.
 * ``promptId`` on user records ties every call back to the message you typed,
   sub-agents included. That is the task id.
-* Sub-agent records are logged when streaming starts, so their
-  ``output_tokens`` is often a placeholder (``stop_reason`` is null). The
-  final call's real usage is in the parent's tool result; we patch it in.
-  Earlier sub-agent calls keep ``output_exact = False``.
+* Sub-agent records are written when streaming starts, so their
+  ``output_tokens`` is often a placeholder (``stop_reason`` is null). We know
+  because Claude Code's own counter (``cost-state`` records) disagrees with
+  them while agreeing to the token with every main-thread call. The final
+  call's real usage is in the parent's tool result: we use it, keep the
+  logged value next to it, and mark the record (``output_source``).
+  Earlier sub-agent calls stay as logged, flagged ``output_exact = False``.
+* ``cost-state`` records are checked against our sums (``CounterCheck``).
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 from ..classify import guess_family
-from ..record import FileEvent, ParseStats, Task, UsageRecord
+from ..record import CounterCheck, FileEvent, ParseStats, Task, UsageRecord
 
 SOURCE = "claude-code"
 VERIFIED_VERSION = "2.1.288"
@@ -83,6 +87,7 @@ class SessionResult:
     file_events: list[FileEvent]
     stats: ParseStats
     version: Optional[str] = None
+    checks: list[CounterCheck] = field(default_factory=list)
 
 
 def discover(root: Path) -> list[SessionFiles]:
@@ -186,6 +191,7 @@ class _Group:
     stop_reason: Optional[str]
     tool_uses: list[dict] = field(default_factory=list)
     order: int = 0
+    main_line: int = -1  # line in the main file, -1 for a sub-agent file
 
 
 @dataclass
@@ -214,8 +220,9 @@ def parse_session(sf: SessionFiles) -> SessionResult:
     version: Optional[str] = None
     cwd: Optional[str] = None
     order = 0
+    checkpoints: list[tuple[int, dict]] = []  # (main-file line, cost-state modelUsage)
 
-    def handle(obj: dict, thread_hint: Optional[str]) -> None:
+    def handle(obj: dict, thread_hint: Optional[str], line: int = -1) -> None:
         nonlocal order, version, cwd
         rtype = obj.get("type")
         if not isinstance(rtype, str):
@@ -303,7 +310,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
             g = groups.get(key)
             if g is None:
                 order += 1
-                g = _Group(key, thread, obj, obj, usage, model, msg.get("stop_reason"), order=order)
+                g = _Group(key, thread, obj, obj, usage, model, msg.get("stop_reason"), order=order,
+                           main_line=line)
                 groups[key] = g
             else:
                 g.last = obj
@@ -330,6 +338,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
 
         if uuid:
             nodes[uuid] = _Node(rtype, parent, pid, ts, kind="other")
+        if rtype == "cost-state" and line >= 0 and isinstance(obj.get("modelUsage"), dict):
+            checkpoints.append((line, obj["modelUsage"]))
         if rtype in KNOWN_IGNORED:
             stats.bump(stats.ignored, rtype)
             if rtype == "system" and "compact" in str(obj.get("subtype", "")) and uuid:
@@ -338,8 +348,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
             stats.bump(stats.unknown_types, rtype)
 
     if sf.main:
-        for obj in _read_jsonl(sf.main, stats):
-            handle(obj, None)
+        for line, obj in enumerate(_read_jsonl(sf.main, stats)):
+            handle(obj, None, line)
     for sub in sf.subagents:
         agent_id = sub.stem[len("agent-"):] if sub.stem.startswith("agent-") else sub.stem
         meta_path = sub.with_name(sub.stem + ".meta.json")
@@ -421,6 +431,7 @@ def parse_session(sf: SessionFiles) -> SessionResult:
     project = Path(cwd).name if cwd else sf.project_dir
     for g in sorted(groups.values(), key=lambda g: g.order):
         usage = patched.get(g.key, g.usage)
+        out_logged = _int(g.usage.get("output_tokens")) or 0
         new = _int(usage.get("input_tokens")) or 0
         cread = _int(usage.get("cache_read_input_tokens")) or 0
         cwrite = _int(usage.get("cache_creation_input_tokens")) or 0
@@ -459,6 +470,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
             project=project,
             agent_id=g.thread if is_sub else None,
             input_cache_write_1h=cwrite_1h,
+            output_source="subagent_result" if g.key in patched else "logged",
+            output_logged=out_logged,
             output_exact=g.key in patched or g.stop_reason is not None,
             extra={
                 "tools": [t["name"] for t in g.tool_uses],
@@ -493,7 +506,49 @@ def parse_session(sf: SessionFiles) -> SessionResult:
                 break
         t.family = guess_family(t.command, [(tu.name, tu.input) for tu in first_tools[:5]])
 
-    return SessionResult(sf.session_id, records, list(tasks.values()), file_events, stats, version)
+    checks = _counter_checks(checkpoints, groups, records, tool_uses, agent_meta)
+    return SessionResult(sf.session_id, records, list(tasks.values()), file_events, stats, version, checks)
+
+
+def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list[CounterCheck]:
+    """Compare our per-model sums with Claude Code's own counter.
+
+    Uses the last ``cost-state`` record of the main file and only the calls
+    made before it: main-thread calls above that line, sub-agent calls whose
+    launching tool call is above it.
+    """
+    if not checkpoints:
+        return []
+    pos, usage = checkpoints[-1]
+
+    def line_of(g: _Group) -> int:
+        if g.main_line >= 0:
+            return g.main_line
+        tu = tool_uses.get(agent_meta.get(g.thread, {}).get("toolUseId", ""))
+        return groups[tu.group].main_line if tu and tu.group in groups else 1 << 60
+
+    covered = {g.key for g in groups.values() if line_of(g) < pos}
+    sums: dict[str, list[int]] = {}
+    for r in records:
+        if r.turn_id in covered:
+            acc = sums.setdefault(r.model, [0, 0, 0, 0, 0])
+            acc[0] += r.input_new
+            acc[1] += r.input_cache_read
+            acc[2] += r.input_cache_write
+            acc[3] += r.output_logged if r.output_logged is not None else r.output_total
+            acc[4] += r.output_total
+    checks = []
+    for model, u in usage.items():
+        if not isinstance(u, dict):
+            continue
+        ours = sums.get(model, [0, 0, 0, 0, 0])
+        checks.append(CounterCheck(
+            model,
+            _int(u.get("inputTokens")) or 0, _int(u.get("cacheReadInputTokens")) or 0,
+            _int(u.get("cacheCreationInputTokens")) or 0, _int(u.get("outputTokens")) or 0,
+            *ours,
+        ))
+    return checks
 
 
 def _trigger(g: _Group, nodes: dict[str, _Node], is_sub: bool):

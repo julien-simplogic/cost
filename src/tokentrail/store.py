@@ -8,12 +8,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .record import FileEvent, ParseStats, Task, UsageRecord
+from .record import CounterCheck, FileEvent, ParseStats, Task, UsageRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DERIVED_TABLES = ("sessions", "records", "tasks", "file_events", "checks")
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS sessions (
     session_key TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS records (
     input_cache_write_1h INTEGER NOT NULL,
     input_new INTEGER NOT NULL,
     output_total INTEGER NOT NULL,
+    output_logged INTEGER,
+    output_source TEXT NOT NULL,
     output_reasoning INTEGER,
     output_exact INTEGER NOT NULL,
     task_id TEXT NOT NULL,
@@ -76,6 +78,13 @@ CREATE TABLE IF NOT EXISTS file_events (
     action TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS file_events_session ON file_events (session_key);
+CREATE TABLE IF NOT EXISTS checks (
+    session_key TEXT NOT NULL,
+    model TEXT NOT NULL,
+    source_input INTEGER, source_cache_read INTEGER, source_cache_write INTEGER, source_output INTEGER,
+    ours_input INTEGER, ours_cache_read INTEGER, ours_cache_write INTEGER,
+    ours_output_logged INTEGER, ours_output INTEGER
+);
 """
 
 
@@ -85,9 +94,16 @@ class Store:
         self.path = path
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        if row and row["value"] != str(SCHEMA_VERSION):
+            # Everything but declared families is derived from the transcripts:
+            # drop it and let the next ingest rebuild it.
+            for t in DERIVED_TABLES:
+                self.db.execute(f"DROP TABLE IF EXISTS {t}")
         self.db.executescript(SCHEMA)
         self.db.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         self.db.commit()
@@ -122,10 +138,11 @@ class Store:
         records: Iterable[UsageRecord],
         tasks: Iterable[Task],
         file_events: Iterable[FileEvent],
+        checks: Iterable[CounterCheck] = (),
     ) -> None:
         db = self.db
         with db:
-            for table in ("records", "tasks", "file_events"):
+            for table in ("records", "tasks", "file_events", "checks"):
                 db.execute(f"DELETE FROM {table} WHERE session_key = ?", (session_key,))
             db.execute(
                 "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?)",
@@ -135,11 +152,13 @@ class Store:
             # A resumed session can repeat calls already logged by its parent
             # session: (source, turn_id) is unique, so they are counted once.
             db.executemany(
-                "INSERT OR IGNORE INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (r.source, r.turn_id, session_key, r.timestamp, r.model, r.input_total,
                      r.input_cache_read, r.input_cache_write, r.input_cache_write_1h,
-                     r.input_new, r.output_total, r.output_reasoning, int(r.output_exact),
+                     r.input_new, r.output_total,
+                     r.output_logged if r.output_logged is not None else r.output_total,
+                     r.output_source, r.output_reasoning, int(r.output_exact),
                      r.task_id, r.trigger, r.duration_ms, r.session_id, r.project,
                      r.agent_id, json.dumps(r.extra))
                     for r in records
@@ -156,6 +175,12 @@ class Store:
             db.executemany(
                 "INSERT INTO file_events VALUES (?,?,?,?,?)",
                 [(session_key, e.task_id, e.timestamp, e.path, e.action) for e in file_events],
+            )
+            db.executemany(
+                "INSERT INTO checks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [(session_key, c.model, c.source_input, c.source_cache_read, c.source_cache_write,
+                  c.source_output, c.ours_input, c.ours_cache_read, c.ours_cache_write,
+                  c.ours_output_logged, c.ours_output) for c in checks],
             )
 
     def tag(self, source: str, task_prefix: str, family: str) -> list[str]:
@@ -216,6 +241,12 @@ class Store:
                 "SELECT * FROM file_events WHERE session_key = ? ORDER BY ts, rowid", (session_key,)
             ).fetchall()
         return self.db.execute("SELECT * FROM file_events ORDER BY ts, rowid").fetchall()
+
+    def checks(self) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT c.*, s.session_id, s.project, s.version FROM checks c "
+            "JOIN sessions s ON s.session_key = c.session_key"
+        ).fetchall()
 
     def parse_stats(self) -> ParseStats:
         total = ParseStats()

@@ -41,6 +41,8 @@ class Row:
     cache_write_1h: int
     input_new: int
     output: int
+    output_logged: int
+    output_source: str
     reasoning: Optional[int]
     output_exact: bool
     task_id: str
@@ -57,8 +59,14 @@ class Row:
     def tokens(self) -> int:
         return self.input_total + self.output
 
+    @property
+    def recovered(self) -> int:
+        """Output tokens not from this call's own log line (0 unless marked)."""
+        return self.output - self.output_logged
 
-def enrich(db_rows: Iterable, prices: PriceTable, tasks: dict) -> list[Row]:
+
+def enrich(db_rows: Iterable, prices: PriceTable, tasks: dict, logged_only: bool = False) -> list[Row]:
+    """logged_only: use each call's own log line for output, ignore recovered figures."""
     out = []
     for r in db_rows:
         extra = json.loads(r["extra"]) if r["extra"] else {}
@@ -67,7 +75,10 @@ def enrich(db_rows: Iterable, prices: PriceTable, tasks: dict) -> list[Row]:
             session_id=r["session_id"] or "", ts=r["ts"], model=r["model"],
             input_total=r["input_total"], cache_read=r["input_cache_read"],
             cache_write=r["input_cache_write"], cache_write_1h=r["input_cache_write_1h"],
-            input_new=r["input_new"], output=r["output_total"], reasoning=r["output_reasoning"],
+            input_new=r["input_new"],
+            output=r["output_logged"] if logged_only else r["output_total"],
+            output_logged=r["output_logged"], output_source=r["output_source"],
+            reasoning=r["output_reasoning"],
             output_exact=bool(r["output_exact"]), task_id=r["task_id"], trigger=r["trigger"],
             duration_ms=r["duration_ms"], project=r["project"] or "?", agent_id=r["agent_id"],
             extra=extra,
@@ -172,6 +183,7 @@ class TaskStats:
     input_total: int = 0
     first_input: int = 0
     sub_tokens: int = 0
+    recovered: int = 0
     cost: float = 0.0
     unpriced: int = 0
     rows: list[Row] = field(default_factory=list)
@@ -203,6 +215,7 @@ def group_tasks(rows: Iterable[Row], tasks: dict) -> list[TaskStats]:
             t.turns_main += 1
         t.tokens += r.tokens
         t.output += r.output
+        t.recovered += r.recovered
         t.input_total += r.input_total
         if r.cost is None:
             t.unpriced += 1

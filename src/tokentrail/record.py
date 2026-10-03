@@ -46,7 +46,13 @@ class UsageRecord:
     project: Optional[str] = None
     agent_id: Optional[str] = None  # set for sub-agent calls
     input_cache_write_1h: int = 0  # part of input_cache_write written with the 1-hour TTL
-    output_exact: bool = True  # False when the source logged the count mid-stream
+    # Where output_total comes from. "logged": the call's own log line.
+    # "subagent_result": the call's own line was written mid-stream; the
+    # figure comes from the sub-agent's result in the parent transcript.
+    # Reports mark these, and --logged-only ignores them.
+    output_source: str = "logged"
+    output_logged: Optional[int] = None  # what the call's own line says (= output_total when logged)
+    output_exact: bool = True  # False: logged mid-stream and not recoverable, a lower bound
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -57,6 +63,13 @@ class UsageRecord:
             raise ValueError(
                 f"input_total {self.input_total} != cache_read + cache_write + new ({parts})"
             )
+
+    @property
+    def output_recovered(self) -> int:
+        """Output tokens not taken from the call's own log line."""
+        if self.output_logged is None:
+            return 0
+        return self.output_total - self.output_logged
 
     @property
     def total_tokens(self) -> int:
@@ -86,6 +99,33 @@ class FileEvent:
     timestamp: str
     path: str
     action: Literal["read", "write", "search"]
+
+
+@dataclass
+class CounterCheck:
+    """One model's totals in a session: the source's own counter vs our sum.
+
+    Claude Code keeps an in-memory counter fed by the API's final usage and
+    writes it to the transcript as ``cost-state`` records. It is computed by a
+    different code path from the per-call lines we read, so agreement means
+    the de-duplication is right, and a gap is a measured gap, not a guess.
+    """
+
+    model: str
+    source_input: int
+    source_cache_read: int
+    source_cache_write: int
+    source_output: int
+    ours_input: int
+    ours_cache_read: int
+    ours_cache_write: int
+    ours_output_logged: int
+    ours_output: int  # logged + recovered
+
+    @property
+    def input_matches(self) -> bool:
+        return (self.source_input, self.source_cache_read, self.source_cache_write) == (
+            self.ours_input, self.ours_cache_read, self.ours_cache_write)
 
 
 @dataclass
