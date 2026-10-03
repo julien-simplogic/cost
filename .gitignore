@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Never commit transcripts or tokentrail data, even by accident:
+# they contain your code, your clients' code and your prompts.
+*.jsonl
+*.sqlite3
+*.sqlite3-journal
+*.db
+
+# Private denylist for scripts/leak_check.py
+.leak-denylist
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

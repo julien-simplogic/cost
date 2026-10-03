@@ -1,0 +1,272 @@
+"""Command 1: where the tokens went, over a period."""
+
+from __future__ import annotations
+
+import hashlib
+from collections import defaultdict
+from typing import Any, Optional
+
+from .analysis import Row, cache_events, enrich, group_tasks
+from .classify import CATEGORIES, CATEGORY_LABELS
+from .prices import PriceTable
+from .store import Store
+
+
+def build(
+    store: Store,
+    prices: PriceTable,
+    *,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    project: Optional[str] = None,
+    top: int = 10,
+    anonymize: bool = False,
+) -> dict[str, Any]:
+    tasks = store.tasks()
+    rows = enrich(store.records(since, until, project), prices, tasks)
+    names = _Anonymizer(anonymize)
+
+    tot_tokens = sum(r.tokens for r in rows)
+    tot_cost = sum(r.cost or 0 for r in rows)
+
+    cats: dict[str, dict[str, float]] = {c: defaultdict(float) for c in CATEGORIES}
+    for r in rows:
+        c = cats[r.category]
+        c["turns"] += 1
+        c["tokens"] += r.tokens
+        c["cost"] += r.cost or 0
+    categories = [
+        {
+            "key": k,
+            "label": CATEGORY_LABELS[k],
+            "turns": int(v["turns"]),
+            "tokens": int(v["tokens"]),
+            "cost": round(v["cost"], 4),
+            "token_share": _share(v["tokens"], tot_tokens),
+            "cost_share": _share(v["cost"], tot_cost),
+        }
+        for k, v in cats.items()
+    ]
+
+    by_session: dict[str, list[Row]] = defaultdict(list)
+    for r in rows:
+        by_session[r.session_key].append(r)
+    sessions = []
+    events = []
+    for key, rs in by_session.items():
+        main = [r for r in rs if r.trigger != "subagent"]
+        events += cache_events(main, prices)
+        cost = sum(r.cost or 0 for r in rs)
+        sub = sum(r.cost or 0 for r in rs if r.trigger == "subagent")
+        sessions.append({
+            "session": names.session(rs[0].session_id),
+            "project": names.project(rs[0].project),
+            "started": rs[0].ts[:16].replace("T", " "),
+            "turns": len(rs),
+            "tasks": len({r.task_id for r in rs}),
+            "tokens": sum(r.tokens for r in rs),
+            "cost": round(cost, 4),
+            "subagent_cost_share": _share(sub, cost),
+        })
+    sessions.sort(key=lambda s: s["cost"], reverse=True)
+
+    task_stats = group_tasks(rows, tasks)
+    task_stats.sort(key=lambda t: t.cost, reverse=True)
+    top_tasks = [
+        {
+            "task": t.task_id[:8],
+            "project": names.project(t.project),
+            "session": names.session(t.rows[0].session_id),
+            "started": t.started[:16].replace("T", " "),
+            "family": t.family,
+            "family_source": t.family_source,
+            "command": t.command,
+            "turns": t.turns,
+            "turns_main": t.turns_main,
+            "turns_subagent": t.turns_sub,
+            "tokens": t.tokens,
+            "cost": round(t.cost, 4),
+            "subagent_token_share": _share(t.sub_tokens, t.tokens),
+        }
+        for t in task_stats[:top]
+    ]
+
+    stats = store.parse_stats()
+    return {
+        "period": {"since": since, "until": until, "project": project},
+        "totals": {
+            "turns": len(rows),
+            "tasks": len(task_stats),
+            "sessions": len(by_session),
+            "tokens": tot_tokens,
+            "input_new": sum(r.input_new for r in rows),
+            "input_cache_read": sum(r.cache_read for r in rows),
+            "input_cache_write": sum(r.cache_write for r in rows),
+            "output": sum(r.output for r in rows),
+            "output_reasoning": sum(r.reasoning or 0 for r in rows),
+            "cost": round(tot_cost, 4),
+            "unpriced_turns": sum(1 for r in rows if r.cost is None),
+            "inexact_output_turns": sum(1 for r in rows if not r.output_exact),
+        },
+        "categories": categories,
+        "sessions": sessions[:top],
+        "tasks": top_tasks,
+        "cache": {
+            "breaks": sum(1 for e in events if e.kind == "break"),
+            "break_cost": round(sum(e.extra_cost or 0 for e in events if e.kind == "break"), 4),
+            "expiries": sum(1 for e in events if e.kind == "expired"),
+            "expiry_cost": round(sum(e.extra_cost or 0 for e in events if e.kind == "expired"), 4),
+        },
+        "parsing": {
+            "files": stats.files,
+            "records": stats.lines,
+            "used": stats.used,
+            "ignored_by_design": sum(stats.ignored.values()),
+            "not_understood": stats.not_understood,
+            "unreadable": stats.unreadable,
+            "unknown_types": stats.unknown_types,
+            "versions": stats.versions,
+        },
+        "prices": {
+            "file": prices.path,
+            "verified_on": prices.verified_on.isoformat() if prices.verified_on else None,
+            "stale": prices.is_stale(),
+        },
+    }
+
+
+def _share(part: float, whole: float) -> float:
+    return round(100 * part / whole, 1) if whole else 0.0
+
+
+class _Anonymizer:
+    """Stable fake names so a report can be shown without client names."""
+
+    def __init__(self, on: bool):
+        self.on = on
+        self.projects: dict[str, str] = {}
+
+    def project(self, name: str) -> str:
+        if not self.on:
+            return name
+        if name not in self.projects:
+            self.projects[name] = f"project-{chr(ord('A') + len(self.projects) % 26)}" + (
+                str(len(self.projects) // 26) if len(self.projects) >= 26 else ""
+            )
+        return self.projects[name]
+
+    def session(self, sid: str) -> str:
+        if not self.on:
+            return sid[:8]
+        return hashlib.sha256(sid.encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def fmt_tokens(n: float) -> str:
+    n = float(n)
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return f"{n:.0f}"
+
+
+def fmt_cost(c: Optional[float]) -> str:
+    if c is None:
+        return "?"
+    return f"${c:,.2f}" if c >= 0.995 else f"${c:.3f}"
+
+
+def _table(headers: list[str], rows: list[list[str]], right: set[int]) -> list[str]:
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
+
+    def line(cells: list[str]) -> str:
+        return "  ".join(
+            c.rjust(widths[i]) if i in right else c.ljust(widths[i]) for i, c in enumerate(cells)
+        ).rstrip()
+
+    return [line(headers), line(["-" * w for w in widths])] + [line(r) for r in rows]
+
+
+def render(rep: dict[str, Any]) -> str:
+    t, p = rep["totals"], rep["parsing"]
+    period = rep["period"]
+    out = []
+    span = f"since {period['since'][:10]}" if period["since"] else "all history"
+    if period["until"]:
+        span += f" until {period['until'][:10]}"
+    if period["project"]:
+        span += f", projects matching '{period['project']}'"
+    out.append(f"tokentrail report: {span}")
+    out.append(
+        f"{t['sessions']} sessions, {t['tasks']} tasks, {t['turns']} model calls, "
+        f"{fmt_tokens(t['tokens'])} tokens, {fmt_cost(t['cost'])} at API prices"
+    )
+    out.append(
+        f"  input: {fmt_tokens(t['input_cache_read'])} cache read, "
+        f"{fmt_tokens(t['input_cache_write'])} cache write, {fmt_tokens(t['input_new'])} new; "
+        f"output: {fmt_tokens(t['output'])} (of which reasoning {fmt_tokens(t['output_reasoning'])})"
+    )
+    out.append("")
+    out.append("Where it went")
+    rows = [
+        [c["label"], str(c["turns"]), fmt_tokens(c["tokens"]), f"{c['token_share']:.0f}%",
+         fmt_cost(c["cost"]), f"{c['cost_share']:.0f}%"]
+        for c in sorted(rep["categories"], key=lambda c: c["cost"], reverse=True)
+    ]
+    out += _table(["consumer", "calls", "tokens", "share", "cost", "share"], rows, {1, 2, 3, 4, 5})
+    out.append("")
+    out.append("Most expensive tasks")
+    rows = [
+        [x["task"], x["project"], x["started"],
+         (x["family"] or "?") + ("*" if x["family_source"] == "declared" else ""),
+         f"{x['turns']} ({x['turns_subagent']} sub)", fmt_tokens(x["tokens"]), fmt_cost(x["cost"]),
+         f"{x['subagent_token_share']:.0f}%"]
+        for x in rep["tasks"]
+    ]
+    out += _table(
+        ["task", "project", "started", "family", "calls", "tokens", "cost", "sub-agents"],
+        rows, {4, 5, 6, 7},
+    )
+    out.append("  family: guessed from the first tool calls; * = declared with `tokentrail tag`")
+    out.append("")
+    out.append("By session")
+    rows = [
+        [s["session"], s["project"], s["started"], str(s["tasks"]), str(s["turns"]),
+         fmt_tokens(s["tokens"]), fmt_cost(s["cost"]), f"{s['subagent_cost_share']:.0f}%"]
+        for s in rep["sessions"]
+    ]
+    out += _table(
+        ["session", "project", "started", "tasks", "calls", "tokens", "cost", "sub-agents"],
+        rows, {3, 4, 5, 6, 7},
+    )
+    c = rep["cache"]
+    if c["breaks"] or c["expiries"]:
+        out.append("")
+        out.append(
+            f"Cache: {c['expiries']} expiries (idle past the TTL) cost {fmt_cost(c['expiry_cost'])} extra; "
+            f"{c['breaks']} breaks (prefix changed) cost {fmt_cost(c['break_cost'])} extra"
+        )
+    out.append("")
+    notes = [
+        f"Read {p['files']} transcript files, {p['records']} records: {p['used']} used, "
+        f"{p['ignored_by_design']} skipped by design, {p['not_understood']} not understood"
+    ]
+    if p["not_understood"]:
+        detail = {**p["unreadable"], **{f"type:{k}": v for k, v in p["unknown_types"].items()}}
+        notes.append("  not understood: " + ", ".join(f"{k}={v}" for k, v in sorted(detail.items())))
+    if t["inexact_output_turns"]:
+        notes.append(
+            f"{t['inexact_output_turns']} sub-agent calls were logged mid-stream: their output counts "
+            "are lower bounds (input counts are exact)"
+        )
+    if t["unpriced_turns"]:
+        notes.append(f"{t['unpriced_turns']} calls use a model missing from the price file (cost not counted)")
+    pr = rep["prices"]
+    notes.append(f"Prices: {pr['file']}, verified {pr['verified_on'] or 'never'}")
+    if pr["stale"]:
+        notes.append("  prices are more than 60 days old: check them, then `tokentrail prices --init` to edit")
+    out += notes
+    return "\n".join(out)

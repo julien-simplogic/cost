@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev]"
+      - name: tests (incl. no-network and write-only-in-data-dir guarantees)
+        run: python -m pytest -q
+      - name: demo runs on invented data
+        run: python scripts/demo.py > /dev/null
+      - name: CLI entry point
+        run: tokentrail --version
+
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # scan every commit, not just the tip
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: leak check (paths, e-mails, domains; private denylist stays local)
+        run: python scripts/leak_check.py
