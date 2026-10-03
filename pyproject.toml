@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-timeout>=2"]
 
 [project.scripts]
 tokentrail = "tokentrail.cli:main"
@@ -34,3 +34,7 @@ tokentrail = ["data/*.toml"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-p no:cacheprovider"
+# A test that waits on something that never comes (stdin, a lock) fails with a
+# stack dump instead of hanging the run. "thread" works on Windows too.
+timeout = 60
+timeout_method = "thread"

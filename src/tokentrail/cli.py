@@ -51,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--no-ingest", action="store_true")
 
     s = sub.add_parser("estimate", help="what the next prompt will cost, before sending it")
-    s.add_argument("text", nargs="*", help="the prompt you are about to send (or use --file / stdin)")
+    s.add_argument("text", nargs="*", help="the prompt you are about to send (or use --file)")
     s.add_argument("--file", type=Path, help="read the prompt from a file ('-' for stdin)")
     s.add_argument("--add", type=Path, action="append", default=[], metavar="PATH",
                    help="a file you will attach or @-mention (repeatable)")
@@ -169,11 +169,19 @@ def _open_store() -> Store:
         ) from e
 
 
+def _claude_code_stdin() -> str:
+    """Claude Code writes its JSON and closes stdin. Typed by hand in a terminal,
+    there is nothing to wait for."""
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
 def _run(args) -> int:
     if args.cmd == "statusline":
         # must print one line whatever happens: Claude Code shows it as is
         try:
-            print(live.statusline(sys.stdin.read()))
+            print(live.statusline(_claude_code_stdin()))
         except Exception as e:  # noqa: BLE001
             if args.debug:
                 raise
@@ -183,7 +191,7 @@ def _run(args) -> int:
     if args.cmd == "hook":
         # never block or slow down a prompt, never write to the model's context
         try:
-            out = live.prompt_hook(sys.stdin.read())
+            out = live.prompt_hook(_claude_code_stdin())
         except Exception:  # noqa: BLE001
             if args.debug:
                 raise
@@ -272,10 +280,10 @@ def _run(args) -> int:
 
         if args.cmd == "estimate":
             text = " ".join(args.text)
+            # stdin is read only when asked for (--file -): an open but silent stdin
+            # (a pipe, a CI runner) would otherwise wait forever
             if args.file:
                 text = sys.stdin.read() if str(args.file) == "-" else args.file.read_text(encoding="utf-8")
-            elif not text and not sys.stdin.isatty():
-                text = sys.stdin.read()
             est = estimate.build(store, table, estimate.EstimateInput(
                 text=text, add_files=tuple(args.add), session=args.session, family=args.family,
                 model=args.model, max_tokens=args.max_tokens, max_turns=args.max_turns,

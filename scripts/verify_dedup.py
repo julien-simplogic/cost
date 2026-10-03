@@ -57,7 +57,7 @@ def session(main: Path):
                 calls += list(lines(meta.with_name(meta.name.replace(".meta.json", ".jsonl"))))
         except (OSError, ValueError):
             continue
-    naive, grouped = {}, {}
+    naive, grouped, lines_per_call = {}, {}, {}
     for o in calls:
         u = usage_of(o)
         if not u:
@@ -67,9 +67,10 @@ def session(main: Path):
         for i, (k, _) in enumerate(FIELDS):
             n[i] += usage.get(k) or 0
         grouped.setdefault(model, {})[mid] = usage  # one line per message.id
+        lines_per_call[mid] = lines_per_call.get(mid, 0) + 1
     counter = {m: [u.get(k) or 0 for _, k in FIELDS] for m, u in records[stop]["modelUsage"].items()}
     grouped = {m: [sum(u.get(k) or 0 for u in ids.values()) for k, _ in FIELDS] for m, ids in grouped.items()}
-    return counter, naive, grouped
+    return counter, naive, grouped, list(lines_per_call.values())
 
 
 def main() -> int:
@@ -77,13 +78,15 @@ def main() -> int:
         os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude", "projects")).expanduser()
     sessions = checked = exact = 0
     tot = {"counter": [0] * 4, "naive": [0] * 4, "grouped": [0] * 4}
+    all_lines: list[int] = []
     for main_file in sorted(root.glob("*/*.jsonl")):
         sessions += 1
         r = session(main_file)
         if r is None:
             continue
         checked += 1
-        counter, naive, grouped = r
+        counter, naive, grouped, per_call = r
+        all_lines += per_call
         # input and cache only: sub-agent output is known to be under-logged
         exact += all(grouped.get(m, [0] * 4)[:3] == c[:3] for m, c in counter.items())
         for name, per_model in (("counter", counter), ("naive", naive), ("grouped", grouped)):
@@ -100,6 +103,10 @@ def main() -> int:
     ratio = [n / c if c else 0 for n, c in zip(tot["naive"], tot["counter"])]
     print(f"{'naive / counter':28}" + "".join(f"{r:>{w}.2f}x" for r, w in zip(ratio, (13, 15, 15, 13))))
     print(f"Sessions where 'one line per message.id' equals the counter for input and cache: {exact} of {checked}.")
+    dist = {k: all_lines.count(k) for k in sorted(set(all_lines))}
+    print(f"Lines per call: mean {sum(all_lines) / len(all_lines):.2f}, distribution "
+          + ", ".join(f"{k} line{'s' if k > 1 else ''}: {n}" for k, n in dist.items()) + ".")
+    print("Each ratio above is this lines-per-call figure, weighted by that column's tokens.")
     return 0
 
 

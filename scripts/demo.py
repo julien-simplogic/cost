@@ -77,7 +77,6 @@ def main() -> None:
         print("\n$ tokentrail report --since 2026-09-21\n")
         cli(["report", "--since", "2026-09-21", "--top", "5", "--no-ingest"])
         print("\n$ tokentrail estimate --family refactor \"split the cart service in two\"\n")
-        os.chdir(t)
         now = (last.last_call_at + timedelta(minutes=4, seconds=15)).isoformat()
         cli(["estimate", "--no-ingest", "--now", now, "--session", last.session_id[:8], "--family", "refactor",
              "--edits", "CLAUDE.md", "split the cart service in two"])

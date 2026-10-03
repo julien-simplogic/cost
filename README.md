@@ -19,9 +19,23 @@ token counts.
 {"type":"assistant","message":{"id":"msg_A","content":[{"type":"tool_use","name":"Bash",...}],"usage":{"input_tokens":2,"cache_read_input_tokens":27925,"cache_creation_input_tokens":19280,"output_tokens":210}}}
 ```
 
-Any tool that sums `usage` over the lines is off by a factor of about 2.4 to 3.2
-(measured below; it depends on how many blocks your calls have), and
-anyone redoing this work will fall into the same trap. **The fix:** group
+Any tool that sums `usage` over the lines overcounts, typically by 2 to 3
+times, and anyone redoing this work will fall into the same trap.
+
+**The overcount is not a fixed factor.** A call written as *k* lines is
+counted *k* times. The overall ratio is therefore the average number of lines
+per call, weighted by tokens, and it depends on how you work:
+
+- a plain answer (thinking + text) is 2 lines;
+- a step of agentic work (thinking + text + tool call) is 3 lines;
+- parallel tool calls make 4 lines or more.
+
+On the session this tool was built in, the cache-read ratio was 2.00 over the
+first 10 calls (questions and answers), 2.54 after 40 calls (coding had
+started), and 2.62 after 152 calls. It does not drift steadily: it jumps when
+the kind of work changes, then plateaus. The ten sub-agent calls barely move
+it. Each column (input, cache, output) weights calls differently, which is why
+each has its own ratio. **The fix:** group
 records by `message.id` (falling back to `requestId`) and count each call once.
 
 **How we know the fix is right.** Claude Code also keeps its own running
@@ -66,6 +80,8 @@ naive sum of every line                576      65,286,318         922,826      
 one line per message.id                230      25,290,661         388,268       170,072
 naive / counter                      2.50x           2.58x           2.38x         2.88x
 Sessions where 'one line per message.id' equals the counter for input and cache: 1 of 1.
+Lines per call: mean 2.54, distribution 1 line: 8, 2 lines: 45, 3 lines: 47, 4 lines: 6, 5 lines: 1, 6 lines: 1.
+Each ratio above is this lines-per-call figure, weighted by that column's tokens.
 ```
 
 **What this proves.** Summing the lines overcounts by the ratio shown, on your
@@ -221,18 +237,34 @@ The most useful part is often the warnings:
 tokentrail setup        # prints the lines to add to ~/.claude/settings.json; edits nothing
 ```
 
-**Status line.** Claude Code runs it after each reply and shows its one line
-under the prompt:
+**Status line.** Claude Code runs it after each reply. It shows what changes
+and what you can act on; anything that is merely reassuring stays in
+`tokentrail check`.
 
 ```
-tokentrail | ctx 34% | cache 98% | $13.63 (incl. recovered) | counter ok
+ctx 43% | 5h 24% | 7d 41% | $17.44 at API rates
 ```
 
-Context used, the session's cache-read share, its cost at API prices, and
-whether its input matches Claude Code's own counter. The last field reads
-`counter ok`, `COUNTER MISMATCH` or `unverified`, and the line never pretends.
-It reads the session's own transcript, so it needs no history and takes about
-0.15 s on a 1.3 MB session.
+- `ctx`: context used.
+- `5h` and `7d`: how much of your plan's 5-hour and weekly windows you have
+  used. These are Claude Code's own figures, documented as `rate_limits`, and
+  only Pro and Max subscribers get them; tokentrail does not know your limits
+  and shows nothing when Claude Code doesn't pass them.
+- `$… at API rates`: the session valued at API prices. On a subscription this
+  is not what you pay; it is a common unit for comparing sessions.
+
+Problems appear only when there are some:
+
+```
+ctx 43% | $17.44 at API rates | ! cache cold: next message re-caches 431k | ! 2 cache misses (last: tools_changed)
+```
+
+The cache alerts use Claude Code's own `prompt_cache` diagnostics when they are
+present; on older versions tokentrail spots a miss itself. The other alerts are
+a mismatch with Claude Code's counter, transcript lines tokentrail could not
+read, and a model missing from the price file. The status line reads only the
+session's transcript, so it needs no history; on a 1.3 MB session it takes
+about 0.15 s.
 
 **Prompt hook (`UserPromptSubmit`).** When you send a prompt, it shows the
 estimate and the warnings:
@@ -243,11 +275,18 @@ tokentrail: next call 430,797 tokens in (429,141 cached), floor $0.099; this tas
 ```
 
 Built on Claude Code's documented interface (code.claude.com/docs/en/hooks
-and /statusline), read before writing it:
+and /statusline), read before writing it.
 
-- **The hook only answers with `systemMessage`, which is shown to you.** Plain
-  output from a `UserPromptSubmit` hook is added to the model's context: that
-  would make every prompt cost more, so tokentrail never prints any.
+> **If you write a `UserPromptSubmit` hook, read this.** On most hook events,
+> plain stdout goes to a debug log. On `UserPromptSubmit` (and
+> `SessionStart`), Claude Code adds plain stdout **to the model's context**.
+> A hook that prints a cost estimate as plain text therefore makes every
+> prompt cost more: a cost-measuring tool that adds cost to each message. To
+> show something to the user only, print JSON with `systemMessage`, which
+> Claude does not see. tokentrail's hook does only that, and a test fails if
+> it prints anything else.
+
+- **The hook only answers with `systemMessage`.**
 - **It never blocks or slows a prompt.** It always exits 0. On any error it
   prints nothing. The suggested timeout is 10 s, against a default of 30. It
   reads only the current session, and predictions use whatever history
@@ -292,9 +331,12 @@ what to do next, and each has a test with its own fixture
 | bad bytes, unreadable files | counted under "not understood", by reason and by Claude Code version |
 | Windows paths and consoles | project names from `C:\...` working directories; characters a console can't show are replaced, not fatal |
 | bad `--since`, broken price file, corrupt database, data folder not writable | what is wrong and the one thing to do |
+| an open stdin nobody writes to (a pipe, a CI runner) | never read unless you ask (`--file -`); the live commands don't wait when typed in a terminal |
 | anything else | a one-line message; `--debug` shows the details |
 
-CI runs the tests on Linux, macOS and Windows.
+CI runs the tests on Linux, macOS and Windows. Each test has a 60-second limit
+and each CI job a 10-minute limit, so a hang fails with a stack dump instead of
+running for hours.
 
 ## Use
 

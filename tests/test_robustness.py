@@ -307,3 +307,45 @@ def test_verify_dedup_script_without_counter(env, capsys):
     sys.argv = ["verify_dedup.py", str(env.projects)]
     assert mod.main() == 1
     assert "does not write the counter" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------- nothing waits forever
+
+
+class _SilentStdin:
+    """An open pipe nobody writes to: reading it would block forever."""
+
+    def isatty(self):
+        return False
+
+    def read(self, *a):
+        raise AssertionError("read from stdin that nobody writes to")
+
+
+def test_estimate_without_text_does_not_wait_for_stdin(env, capsys, monkeypatch):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(write=500)
+    s.write()
+    monkeypatch.setattr(sys, "stdin", _SilentStdin())
+    code, out, _ = run(capsys, "estimate", "--session", s.session_id[:8])
+    assert code == 0 and "Computed" in out
+
+
+def test_live_commands_typed_by_hand_do_not_wait(env, capsys, monkeypatch):
+    class Terminal(_SilentStdin):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", Terminal())
+    assert main(["statusline"]) == 0
+    assert capsys.readouterr().out.startswith("tokentrail:")
+    assert main(["hook", "prompt"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_demo_does_not_sit_in_the_folder_it_deletes():
+    from pathlib import Path
+
+    demo = (Path(__file__).parent.parent / "scripts" / "demo.py").read_text()
+    assert "chdir" not in demo  # Windows cannot delete the current directory

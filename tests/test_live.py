@@ -28,22 +28,57 @@ def _session(env, counter=True, n_reads=0):
     return s.write(), s
 
 
-def test_statusline_shows_context_cache_cost_and_verification(env, capsys, monkeypatch):
+def test_statusline_shows_only_what_changes_when_all_is_well(env, capsys, monkeypatch):
     tp, _ = _session(env)
-    _feed(monkeypatch, {"transcript_path": str(tp), "context_window": {"used_percentage": 21.4}})
+    _feed(monkeypatch, {"transcript_path": str(tp), "context_window": {"used_percentage": 21.4},
+                        "prompt_cache": {"warm": True, "misses": 0}})
     assert main(["statusline"]) == 0
     line = capsys.readouterr().out.strip()
-    assert line.startswith("tokentrail | ctx 21% | cache ")
-    assert "$" in line and line.endswith("counter ok")
-    assert "\n" not in line
+    assert line.startswith("ctx 21% | $") and line.endswith(" at API rates")
+    for reassurance in ("counter ok", "unverified", "recovered", "cache 9", "!"):
+        assert reassurance not in line
 
 
-def test_statusline_without_counter_says_unverified(env, capsys, monkeypatch):
-    tp, _ = _session(env, counter=False)
-    _feed(monkeypatch, {"transcript_path": str(tp), "context_window": {"context_window_size": 200_000}})
+def test_statusline_shows_plan_usage_only_when_claude_code_passes_it(env, capsys, monkeypatch):
+    tp, _ = _session(env)
+    _feed(monkeypatch, {"transcript_path": str(tp), "context_window": {"used_percentage": 5},
+                        "rate_limits": {"five_hour": {"used_percentage": 23.5},
+                                        "seven_day": {"used_percentage": 41.2}}})
     main(["statusline"])
-    line = capsys.readouterr().out.strip()
-    assert "ctx 21%" in line and line.endswith("unverified")  # (42,300 + 400) / 200,000
+    assert "| 5h 24% | 7d 41% |" in capsys.readouterr().out
+    _feed(monkeypatch, {"transcript_path": str(tp)})  # API key users: no rate_limits
+    main(["statusline"])
+    out = capsys.readouterr().out
+    assert "5h" not in out and "7d" not in out
+
+
+def test_statusline_raises_problems(env, capsys, monkeypatch):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(write=20_000)
+    s.call(read=20_000, write=500)
+    s.cost_state({"claude-opus-5-5": {"inputTokens": 999, "cacheReadInputTokens": 0,
+                                      "cacheCreationInputTokens": 0, "outputTokens": 0}})
+    tp = s.write()
+    _feed(monkeypatch, {"transcript_path": str(tp), "context_window": {"context_window_size": 1_000_000},
+                        "prompt_cache": {"warm": False, "recache_tokens_if_cold": 20_500, "misses": 2,
+                                         "last_miss_cause": {"causes": ["tools_changed"]}}})
+    main(["statusline"])
+    line = capsys.readouterr().out
+    assert "! cache cold: next message re-caches 20k" in line
+    assert "! 2 cache misses (last: tools_changed)" in line
+    assert "! COUNTER MISMATCH: run tokentrail check" in line
+
+
+def test_statusline_detects_a_miss_itself_on_versions_without_prompt_cache(env, capsys, monkeypatch):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(write=50_000)
+    s.call(new=2, write=50_200)  # the whole context written again
+    tp = s.write()
+    _feed(monkeypatch, {"transcript_path": str(tp)})
+    main(["statusline"])
+    assert "! cache missed on the last call" in capsys.readouterr().out
 
 
 def test_statusline_survives_anything(env, capsys, monkeypatch):
@@ -51,7 +86,7 @@ def test_statusline_survives_anything(env, capsys, monkeypatch):
         _feed(monkeypatch, payload)
         assert main(["statusline"]) == 0
         out = capsys.readouterr().out
-        assert out.count("\n") == 1 and out.startswith("tokentrail")
+        assert out.count("\n") == 1 and out.startswith("tokentrail:")
 
 
 def test_hook_answers_with_a_user_only_message(env, capsys, monkeypatch):

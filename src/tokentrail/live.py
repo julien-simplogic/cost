@@ -43,6 +43,14 @@ def _read_stdin_json(raw: str) -> dict[str, Any]:
 
 
 def statusline(raw_stdin: str) -> str:
+    """One line: what changes and what you can act on. Problems only when there are some.
+
+    Always: context used, your plan's usage windows when Claude Code passes them
+    (Pro/Max, documented as rate_limits), and the session's value at API rates.
+    Only when something is wrong: cold or missed cache, a mismatch with Claude
+    Code's counter, unread transcript lines, a model missing from the price file.
+    Everything that is merely reassuring belongs to `tokentrail check`.
+    """
     data = _read_stdin_json(raw_stdin)
     tp = data.get("transcript_path")
     if not isinstance(tp, str) or not Path(tp).is_file():
@@ -55,9 +63,8 @@ def statusline(raw_stdin: str) -> str:
     last = main[-1] if main else res.records[-1]
 
     parts = []
-    ctx = data.get("context_window") if isinstance(data.get("context_window"), dict) else {}
-    pct = ctx.get("used_percentage")
-    size = ctx.get("context_window_size")
+    ctx = _obj(data, "context_window")
+    pct, size = ctx.get("used_percentage"), ctx.get("context_window_size")
     if isinstance(pct, (int, float)):
         parts.append(f"ctx {pct:.0f}%")
     elif isinstance(size, int) and size > 0:
@@ -65,12 +72,13 @@ def statusline(raw_stdin: str) -> str:
     else:
         parts.append(f"ctx {fmt_tokens(last.input_total + last.output_total)}")
 
-    total_in = sum(r.input_total for r in res.records)
-    if total_in:
-        parts.append(f"cache {100 * sum(r.input_cache_read for r in res.records) / total_in:.0f}%")
+    limits = _obj(data, "rate_limits")
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        used = _obj(limits, key).get("used_percentage")
+        if isinstance(used, (int, float)):
+            parts.append(f"{label} {used:.0f}%")
 
-    cost = 0.0
-    unpriced = 0
+    cost, unpriced = 0.0, 0
     for r in res.records:
         c = table.cost(r.model, new=r.input_new, cache_read=r.input_cache_read,
                        cache_write=r.input_cache_write, cache_write_1h=r.input_cache_write_1h,
@@ -79,16 +87,35 @@ def statusline(raw_stdin: str) -> str:
             unpriced += 1
         else:
             cost += c
-    recovered = any(r.output_recovered for r in res.records)
-    parts.append(f"{fmt_cost(cost)}{'*' if unpriced else ''}{' (incl. recovered)' if recovered else ''}")
+    parts.append(f"{fmt_cost(cost)} at API rates")
 
-    if res.checks:
-        parts.append("counter ok" if all(c.input_matches for c in res.checks) else "COUNTER MISMATCH")
-    else:
-        parts.append("unverified")
+    alerts = []
+    cache = _obj(data, "prompt_cache")
+    if cache:
+        if cache.get("warm") is False and isinstance(cache.get("recache_tokens_if_cold"), int):
+            alerts.append(f"cache cold: next message re-caches {fmt_tokens(cache['recache_tokens_if_cold'])}")
+        misses = cache.get("misses")
+        if isinstance(misses, int) and misses > 0:
+            causes = _obj(cache, "last_miss_cause").get("causes")
+            why = f" (last: {', '.join(map(str, causes))})" if isinstance(causes, list) and causes else ""
+            alerts.append(f"{misses} cache miss{'es' if misses > 1 else ''}{why}")
+    elif len(main) >= 2:
+        prev = main[-2]
+        if prev.input_total >= 4096 and last.input_cache_read < 0.5 * prev.input_total \
+                and last.input_total >= 0.5 * prev.input_total:
+            alerts.append("cache missed on the last call")
+    if res.checks and not all(c.input_matches for c in res.checks):
+        alerts.append("COUNTER MISMATCH: run tokentrail check")
     if res.stats.not_understood:
-        parts.append(f"{res.stats.not_understood} unread")
-    return "tokentrail | " + " | ".join(parts)
+        alerts.append(f"{res.stats.not_understood} lines unread: run tokentrail check")
+    if unpriced:
+        alerts.append(f"{unpriced} calls unpriced: model missing from the price file")
+    return " | ".join(parts + [f"! {a}" for a in alerts])
+
+
+def _obj(d: Any, key: str) -> dict:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, dict) else {}
 
 
 # ------------------------------------------------------------------ prompt hook
