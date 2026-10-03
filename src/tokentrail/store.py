@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 
 from .record import CounterCheck, FileEvent, ParseStats, Task, UsageRecord
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DERIVED_TABLES = ("sessions", "records", "tasks", "file_events", "checks")
 
 SCHEMA = """
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT,
     version TEXT,
     signature TEXT NOT NULL,
-    stats TEXT NOT NULL
+    stats TEXT NOT NULL,
+    coverage TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS records (
     source TEXT NOT NULL,
@@ -139,15 +140,16 @@ class Store:
         tasks: Iterable[Task],
         file_events: Iterable[FileEvent],
         checks: Iterable[CounterCheck] = (),
+        coverage: Optional[dict] = None,
     ) -> None:
         db = self.db
         with db:
             for table in ("records", "tasks", "file_events", "checks"):
                 db.execute(f"DELETE FROM {table} WHERE session_key = ?", (session_key,))
             db.execute(
-                "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
                 (session_key, source, session_id, project, cwd, version, signature,
-                 json.dumps(asdict(stats))),
+                 json.dumps(asdict(stats)), json.dumps(coverage or {})),
             )
             # A resumed session can repeat calls already logged by its parent
             # session: (source, turn_id) is unique, so they are counted once.
@@ -251,7 +253,7 @@ class Store:
 
     def checks(self) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT c.*, s.session_id, s.project, s.version FROM checks c "
+            "SELECT c.*, s.session_id, s.project, s.version, s.coverage FROM checks c "
             "JOIN sessions s ON s.session_key = c.session_key"
         ).fetchall()
 

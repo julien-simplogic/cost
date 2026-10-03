@@ -282,13 +282,13 @@ def test_verify_dedup_script_reproduces_the_claim(env, capsys):
     assert mod.main() == 0
     out = capsys.readouterr().out
     assert "1 carry Claude Code's counter" in out
-    assert "equals the counter for input and cache: 1 of 1" in out
+    assert "equals the counter for input and cache: 1 of 1; above it (would mean overcounting): 0" in out
     # call 1 is 3 lines, call 2 is 2 lines, each repeating its usage:
     #   input       (2*3 + 2*2) / (2 + 2)          = 10 / 4        = 2.50x
     #   cache read  (0*3 + 5000*2) / 5000          = 2.00x
     #   cache write (5000*3 + 100*2) / 5100        = 15200 / 5100  = 2.98x
     #   output      (100*3 + 100*2) / 200          = 2.50x
-    ratios = [l for l in out.splitlines() if l.startswith("naive / counter")][0].split()[-4:]
+    ratios = [l for l in out.splitlines() if l.startswith("naive / one per message.id")][0].split()[-4:]
     assert ratios == ["2.50x", "2.00x", "2.98x", "2.50x"]
 
 

@@ -88,6 +88,8 @@ class SessionResult:
     stats: ParseStats
     version: Optional[str] = None
     checks: list[CounterCheck] = field(default_factory=list)
+    coverage: dict[str, int] = field(default_factory=dict)  # which calls the counter check covered
+    session_ids: dict[str, int] = field(default_factory=dict)  # sessionId values seen in the main file
 
 
 def discover(root: Path) -> list[SessionFiles]:
@@ -109,6 +111,21 @@ def discover(root: Path) -> list[SessionFiles]:
 
 # --------------------------------------------------------------------------
 # helpers
+
+
+_TOKEN_KEYS = frozenset({"usage", "input_tokens", "output_tokens", "cache_read_input_tokens",
+                         "cache_creation_input_tokens", "inputTokens", "outputTokens", "modelUsage"})
+
+
+def _has_token_fields(obj: Any, depth: int = 0) -> bool:
+    """Does a record we don't know carry token counts anywhere (a few levels deep)?"""
+    if depth > 5:
+        return False
+    if isinstance(obj, dict):
+        return any(k in _TOKEN_KEYS or _has_token_fields(v, depth + 1) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_has_token_fields(v, depth + 1) for v in obj[:50])
+    return False
 
 
 def project_name(cwd: str) -> str:
@@ -230,6 +247,7 @@ def parse_session(sf: SessionFiles) -> SessionResult:
     cwd: Optional[str] = None
     order = 0
     checkpoints: list[tuple[int, dict]] = []  # (main-file line, cost-state modelUsage)
+    session_ids: dict[str, int] = {}
 
     def handle(obj: dict, thread_hint: Optional[str], line: int = -1) -> None:
         nonlocal order, version, cwd
@@ -243,6 +261,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
             version = v
         if cwd is None and isinstance(obj.get("cwd"), str):
             cwd = obj["cwd"]
+        if thread_hint is None and isinstance(obj.get("sessionId"), str):
+            session_ids[obj["sessionId"]] = session_ids.get(obj["sessionId"], 0) + 1
         uuid = obj.get("uuid") if isinstance(obj.get("uuid"), str) else None
         parent = obj.get("parentUuid") if isinstance(obj.get("parentUuid"), str) else None
         pid = obj.get("promptId") if isinstance(obj.get("promptId"), str) else None
@@ -355,6 +375,8 @@ def parse_session(sf: SessionFiles) -> SessionResult:
                 compaction_after.add(uuid)
         else:
             stats.bump(stats.unknown_types, rtype)
+            if _has_token_fields(obj):
+                stats.bump(stats.unknown_with_tokens, rtype)
 
     if sf.main:
         for line, obj in enumerate(_read_jsonl(sf.main, stats)):
@@ -518,11 +540,16 @@ def parse_session(sf: SessionFiles) -> SessionResult:
                 break
         t.family = guess_family(t.command, [(tu.name, tu.input) for tu in first_tools[:5]])
 
-    checks = _counter_checks(checkpoints, groups, records, tool_uses, agent_meta)
-    return SessionResult(sf.session_id, records, list(tasks.values()), file_events, stats, version, checks)
+    checks, coverage = _counter_checks(checkpoints, groups, records, tool_uses, agent_meta)
+    coverage["counter_records"] = len(checkpoints)
+    coverage["subagent_files"] = len(sf.subagents)
+    coverage["subagent_files_linked"] = sum(
+        1 for a, m in agent_meta.items() if m.get("toolUseId") in tool_uses)
+    return SessionResult(sf.session_id, records, list(tasks.values()), file_events, stats, version,
+                         checks, coverage, session_ids)
 
 
-def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list[CounterCheck]:
+def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta):
     """Compare our per-model sums with Claude Code's own counter.
 
     Uses the last ``cost-state`` record of the main file and only the calls
@@ -530,7 +557,7 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list
     launching tool call is above it.
     """
     if not checkpoints:
-        return []
+        return [], {}
     pos, usage = checkpoints[-1]
 
     def line_of(g: _Group) -> int:
@@ -539,7 +566,15 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list
         tu = tool_uses.get(agent_meta.get(g.thread, {}).get("toolUseId", ""))
         return groups[tu.group].main_line if tu and tu.group in groups else 1 << 60
 
-    covered = {g.key for g in groups.values() if line_of(g) < pos}
+    lines = {g.key: line_of(g) for g in groups.values()}
+    covered = {k for k, ln in lines.items() if ln < pos}
+    coverage = {
+        "calls_covered": len(covered),
+        "main_calls_after_counter": sum(1 for g in groups.values() if g.main_line >= pos),
+        "subagent_calls_after_counter": sum(
+            1 for g in groups.values() if g.main_line < 0 and pos <= lines[g.key] < 1 << 60),
+        "subagent_calls_unlinked": sum(1 for g in groups.values() if lines[g.key] == 1 << 60),
+    }
     sums: dict[str, list[int]] = {}
     for r in records:
         if r.turn_id in covered:
@@ -550,9 +585,10 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list
             acc[3] += r.output_logged if r.output_logged is not None else r.output_total
             acc[4] += r.output_total
     checks = []
-    for model, u in usage.items():
-        if not isinstance(u, dict):
-            continue
+    # every model on either side: a model only one side names must show, not vanish
+    for model in list(usage) + [m for m in sums if m not in usage]:
+        u = usage.get(model)
+        u = u if isinstance(u, dict) else {}
         ours = sums.get(model, [0, 0, 0, 0, 0])
         checks.append(CounterCheck(
             model,
@@ -560,7 +596,7 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta) -> list
             _int(u.get("cacheCreationInputTokens")) or 0, _int(u.get("outputTokens")) or 0,
             *ours,
         ))
-    return checks
+    return checks, coverage
 
 
 def _trigger(g: _Group, nodes: dict[str, _Node], is_sub: bool):

@@ -143,6 +143,7 @@ def build(
             "not_understood": stats.not_understood,
             "unreadable": stats.unreadable,
             "unknown_types": stats.unknown_types,
+            "unknown_with_tokens": stats.unknown_with_tokens,
             "versions": stats.versions,
             "not_understood_by_version": _not_understood_by_version(store),
         },
@@ -160,24 +161,65 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
     for c in store.checks():
         if c["session_key"] in session_keys:
             by_session.setdefault(c["session_key"], []).append(c)
-    input_ok = [k for k, cs in by_session.items() if all(
-        (c["source_input"], c["source_cache_read"], c["source_cache_write"])
-        == (c["ours_input"], c["ours_cache_read"], c["ours_cache_write"]) for c in cs)]
-    mismatched = [
-        {"session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
-         "version": cs[0]["version"]}
-        for k, cs in by_session.items() if k not in input_ok
-    ]
+    input_ok = [k for k, cs in by_session.items() if _rows_match(cs)]
+    mismatched = []
+    for k, cs in by_session.items():
+        if k in input_ok:
+            continue
+        src = sum(c["source_input"] + c["source_cache_read"] + c["source_cache_write"] for c in cs)
+        ours = sum(c["ours_input"] + c["ours_cache_read"] + c["ours_cache_write"] for c in cs)
+        cov = json.loads(cs[0]["coverage"] or "{}")
+        mismatched.append({
+            "session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
+            "version": cs[0]["version"],
+            "input_gap": ours - src,  # signed: positive = we count more than the counter
+            "input_gap_pct": 100 * (ours - src) / src if src else None,
+            "output_gap": sum(c["ours_output"] for c in cs) - sum(c["source_output"] for c in cs),
+            "calls_after_counter": cov.get("main_calls_after_counter", 0) + cov.get("subagent_calls_after_counter", 0),
+            "subagent_calls_unlinked": cov.get("subagent_calls_unlinked", 0),
+            "models_counter_only": sorted(c["model"] for c in cs if c["ours_input"] + c["ours_cache_read"]
+                                          + c["ours_cache_write"] == 0 and c["source_input"] + c["source_cache_read"] + c["source_cache_write"]),
+            "models_lines_only": sorted(c["model"] for c in cs if c["source_input"] + c["source_cache_read"]
+                                        + c["source_cache_write"] == 0 and c["ours_input"] + c["ours_cache_read"] + c["ours_cache_write"]),
+        })
+    mismatched.sort(key=lambda m: abs(m["input_gap_pct"] or 0), reverse=True)
     all_c = [c for cs in by_session.values() for c in cs]
+
+    def side(prefix: str) -> int:
+        return sum(c[f"{prefix}_input"] + c[f"{prefix}_cache_read"] + c[f"{prefix}_cache_write"] for c in all_c)
+
+    # A duplicate or misread call makes us count MORE than Claude Code: that is a bug.
+    # Counting LESS means the counter holds usage no call line records (a tool's own
+    # model calls such as WebFetch reading a page, sub-agent output logged mid-stream).
+    over = [m for m in mismatched if m["input_gap"] > 0]
     return {
         "sessions_in_period": len(session_keys),
         "sessions_checkable": len(by_session),
         "sessions_input_exact": len(input_ok),
+        "sessions_over": len(over),
+        "sessions_under": len(mismatched) - len(over),
+        "counter_input": side("source"),
+        "lines_input": side("ours"),
         "mismatched": mismatched,
         "source_output": sum(c["source_output"] for c in all_c),
         "ours_output_logged": sum(c["ours_output_logged"] for c in all_c),
         "ours_output": sum(c["ours_output"] for c in all_c),
     }
+
+
+def _fmt_pct(p: Optional[float]) -> str:
+    """Signed, and never rounded to a misleading zero."""
+    if p is None:
+        return "no counter input"
+    if p != 0 and abs(p) < 0.01:
+        return f"{'+' if p > 0 else '-'}<0.01%"
+    return f"{p:+.2f}%"
+
+
+def _rows_match(rows) -> bool:
+    """Input and cache summed over every model of the session, ours vs Claude Code's counter."""
+    return all(sum(r[f"source_{k}"] for r in rows) == sum(r[f"ours_{k}"] for r in rows)
+               for k in ("input", "cache_read", "cache_write"))
 
 
 def _not_understood_by_version(store: Store) -> dict[str, int]:
@@ -316,14 +358,21 @@ def render(rep: dict[str, Any]) -> str:
 
 
 def verification_banner(ck: dict[str, Any]) -> str:
-    """First thing a reader sees: are these totals checked against anything?"""
+    """First thing a reader sees: are these totals checked against anything, and how did it go?"""
     n, k, ok = ck["sessions_in_period"], ck["sessions_checkable"], ck["sessions_input_exact"]
+    over, under = ck.get("sessions_over", 0), ck.get("sessions_under", 0)
     if k == 0:
         return (f"NOT VERIFIED: none of these {n} sessions carries Claude Code's own counter "
                 "(cost-state), so nothing checks the totals below.")
-    if ok < k:
-        return (f"MISMATCH: in {k - ok} of {k} checkable sessions, input does not match Claude Code's "
-                "own counter. Do not trust these totals; see 'How sure' at the end.")
+    if over:
+        return (f"MISMATCH: in {over} of {k} checkable sessions tokentrail counts MORE input than Claude Code's "
+                "own counter, which means a counting error. Do not trust these totals; see 'How sure' at the end.")
+    unchecked = f"; {n - k} sessions carry no counter and are unchecked" if k < n else ""
+    if under:
+        pct = 100 * ck["lines_input"] / ck["counter_input"] if ck["counter_input"] else 0
+        return (f"Checked against Claude Code's counter in {k} of {n} sessions: never more than it, exact in {ok}. "
+                f"The call lines hold {pct:.1f}% of the counter's input; the rest is usage no call line records "
+                f"(see 'How sure'){unchecked}.")
     if k < n:
         return (f"Partly verified: input matches Claude Code's own counter to the token in {k} of {n} "
                 f"sessions; the other {n - k} carry no counter and are unchecked.")
@@ -341,6 +390,14 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
     if p["not_understood"]:
         detail = {**p["unreadable"], **{f"type:{k}": v for k, v in p["unknown_types"].items()}}
         out.append("    not understood: " + ", ".join(f"{k}={v}" for k, v in sorted(detail.items())))
+        if p["unknown_types"]:
+            tok = p.get("unknown_with_tokens") or {}
+            out.append(
+                "    of the unknown record types, " + (
+                    "these carry token fields and may hold usage counted nowhere: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(tok.items()))
+                    if tok else "none carries a token field (usage, input_tokens, ...): nothing is missing from the totals")
+            )
         by_v = p.get("not_understood_by_version") or {}
         if by_v:
             out.append("    by Claude Code version: " + ", ".join(f"{v}={n}" for v, n in sorted(by_v.items())))
@@ -369,8 +426,33 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
             + (f" ({fmt_tokens(gap)} not visible in the per-call lines)" if gap > 0 else "")
             + ("" if gap > 0 else " (match)") + "."
         )
-        for m in ck["mismatched"]:
-            out.append(f"    input mismatch: session {m['session']} ({m['project']}, Claude Code {m['version']})")
+        missing = ck["counter_input"] - ck["lines_input"]
+        if missing > 0:
+            out.append(
+                f"    Claude Code's counter holds {fmt_tokens(missing)} input tokens (cache included) that no call "
+                "line records, in the checked sessions. They are not in the totals or categories above, because "
+                "they can't be attributed to a call. Known causes: tools that run a model themselves (WebFetch "
+                "reading a page). `tokentrail diagnose <session>` shows which models."
+            )
+        if ck["mismatched"]:
+            out.append("    sessions that disagree, largest first (input + cache, ours minus counter; + = we count more):")
+            for m in ck["mismatched"][:15]:
+                pct = _fmt_pct(m["input_gap_pct"])
+                extra = []
+                if m["calls_after_counter"]:
+                    extra.append(f"{m['calls_after_counter']} calls after the counter (not compared)")
+                if m["subagent_calls_unlinked"]:
+                    extra.append(f"{m['subagent_calls_unlinked']} sub-agent calls not linked to a launch")
+                if m["models_counter_only"]:
+                    extra.append("models only in the counter: " + ", ".join(m["models_counter_only"]))
+                if m["models_lines_only"]:
+                    extra.append("models only in the lines: " + ", ".join(m["models_lines_only"]))
+                out.append(
+                    f"      {m['session']} ({m['project']}, {m['version']}): input {m['input_gap']:+,} ({pct}), "
+                    f"output {m['output_gap']:+,}" + (f"; {'; '.join(extra)}" if extra else "")
+                )
+            if len(ck["mismatched"]) > 15:
+                out.append(f"      ... and {len(ck['mismatched']) - 15} more (`tokentrail report --json` lists all)")
     else:
         out.append("  No session in this period carries Claude Code's own counter: totals are unchecked.")
     if t["unpriced_turns"]:
@@ -404,8 +486,7 @@ def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
         cs = checks.get(key)
         if cs:
             v["checkable"] += 1
-            exact = all((c["source_input"], c["source_cache_read"], c["source_cache_write"])
-                        == (c["ours_input"], c["ours_cache_read"], c["ours_cache_write"]) for c in cs)
+            exact = _rows_match(cs)
             v["input_exact"] += int(exact)
             v["output_gap"] += sum(c["source_output"] - c["ours_output"] for c in cs)
 

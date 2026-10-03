@@ -76,8 +76,9 @@ def session(main: Path):
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude", "projects")).expanduser()
-    sessions = checked = exact = 0
+    sessions = checked = exact = over = 0
     tot = {"counter": [0] * 4, "naive": [0] * 4, "grouped": [0] * 4}
+    by_model: dict = {}
     all_lines: list[int] = []
     for main_file in sorted(root.glob("*/*.jsonl")):
         sessions += 1
@@ -88,7 +89,14 @@ def main() -> int:
         counter, naive, grouped, per_call = r
         all_lines += per_call
         # input and cache only: sub-agent output is known to be under-logged
-        exact += all(grouped.get(m, [0] * 4)[:3] == c[:3] for m, c in counter.items())
+        g3 = sum(sum(v[:3]) for v in grouped.values())
+        c3 = sum(sum(v[:3]) for v in counter.values())
+        exact += g3 == c3
+        over += g3 > c3
+        for m in set(counter) | set(grouped):
+            pm = by_model.setdefault(m, [0, 0])
+            pm[0] += sum(counter.get(m, [0] * 4)[:3])
+            pm[1] += sum(grouped.get(m, [0] * 4)[:3])
         for name, per_model in (("counter", counter), ("naive", naive), ("grouped", grouped)):
             for v in per_model.values():
                 tot[name] = [a + b for a, b in zip(tot[name], v)]
@@ -100,9 +108,16 @@ def main() -> int:
     for label, key in (("Claude Code's counter", "counter"), ("naive sum of every line", "naive"),
                        ("one line per message.id", "grouped")):
         print(f"{label:28}" + "".join(f"{v:>{w},}" for v, w in zip(tot[key], (14, 16, 16, 14))))
-    ratio = [n / c if c else 0 for n, c in zip(tot["naive"], tot["counter"])]
-    print(f"{'naive / counter':28}" + "".join(f"{r:>{w}.2f}x" for r, w in zip(ratio, (13, 15, 15, 13))))
-    print(f"Sessions where 'one line per message.id' equals the counter for input and cache: {exact} of {checked}.")
+    # the duplication factor: same calls, counted once per line vs once per message.id
+    ratio = [n / g if g else 0 for n, g in zip(tot["naive"], tot["grouped"])]
+    print(f"{'naive / one per message.id':28}" + "".join(f"{r:>{w}.2f}x" for r, w in zip(ratio, (13, 15, 15, 13))))
+    print(f"Sessions where 'one line per message.id' equals the counter for input and cache: {exact} of {checked}; "
+          f"above it (would mean overcounting): {over}.")
+    print("Input and cache by model (counter vs one line per message.id):")
+    for m, (c, g) in sorted(by_model.items()):
+        print(f"  {m:34}{c:>16,}{g:>16,}{g - c:>+16,}")
+    print("A model the counter has more of usually ran inside a tool (WebFetch reading a page),"
+          " which writes no call line.")
     dist = {k: all_lines.count(k) for k in sorted(set(all_lines))}
     print(f"Lines per call: mean {sum(all_lines) / len(all_lines):.2f}, distribution "
           + ", ".join(f"{k} line{'s' if k > 1 else ''}: {n}" for k, n in dist.items()) + ".")

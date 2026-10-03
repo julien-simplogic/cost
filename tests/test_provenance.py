@@ -100,7 +100,9 @@ def test_input_mismatch_is_reported(env, capsys):
     _session(env.projects, counter_input_delta=5)
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert "match to the token in 0" in out and "input mismatch" in out
+    assert "match to the token in 0" in out
+    # signed and sized: we count 5 fewer input tokens than the counter
+    assert "): input -5 (-<0.01%), output -87" in out
 
 
 def test_check_command(env, capsys):

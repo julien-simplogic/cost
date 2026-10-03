@@ -135,6 +135,9 @@ def test_setup_snippet_matches_the_documented_shape(env, capsys):
     main(["setup"])
     text = capsys.readouterr().out
     snippet = json.loads(text[text.index("{"): text.rindex("}") + 1])
-    assert snippet["statusLine"] == {"type": "command", "command": "tokentrail statusline"}
+    # the command is this tokentrail, by absolute path when it can be found
+    assert snippet["statusLine"]["type"] == "command"
+    assert snippet["statusLine"]["command"].endswith("tokentrail statusline")
     [group] = snippet["hooks"]["UserPromptSubmit"]
-    assert group["hooks"][0]["type"] == "command" and group["hooks"][0]["command"] == "tokentrail hook prompt"
+    assert group["hooks"][0]["type"] == "command"
+    assert group["hooks"][0]["command"].endswith("tokentrail hook prompt")

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import __version__, estimate, live, paths, prices, report
+from . import __version__, diagnose, estimate, live, paths, prices, report
 from .analysis import parse_since
 from .classify import FAMILIES
 from .collectors import claude_code
@@ -79,6 +79,8 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("hook", help="Claude Code hooks (read Claude Code's JSON on stdin)")
     s.add_argument("event", choices=["prompt"], help="prompt: UserPromptSubmit")
     sub.add_parser("setup", help="print the settings.json lines that turn on the live display")
+    s = sub.add_parser("diagnose", help="one session vs Claude Code's counter, numbers only (safe to paste)")
+    s.add_argument("session", help="session id or prefix")
     return p
 
 
@@ -198,6 +200,10 @@ def _run(args) -> int:
             out = None
         if out:
             print(out)
+        return 0
+
+    if args.cmd == "diagnose":
+        print(diagnose.run(args.source_dir or paths.claude_code_dir(), args.session))
         return 0
 
     if args.cmd == "setup":

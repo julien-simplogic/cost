@@ -20,6 +20,7 @@ from typing import Any, Optional
 from . import estimate, paths, prices
 from .collectors import claude_code
 from .errors import TokentrailError
+from .record import totals_match
 from .ingest import ingest_claude_code
 from .report import fmt_cost, fmt_tokens
 from .store import Store
@@ -104,7 +105,7 @@ def statusline(raw_stdin: str) -> str:
         if prev.input_total >= 4096 and last.input_cache_read < 0.5 * prev.input_total \
                 and last.input_total >= 0.5 * prev.input_total:
             alerts.append("cache missed on the last call")
-    if res.checks and not all(c.input_matches for c in res.checks):
+    if res.checks and not totals_match(res.checks):
         alerts.append("COUNTER MISMATCH: run tokentrail check")
     if res.stats.not_understood:
         alerts.append(f"{res.stats.not_understood} lines unread: run tokentrail check")
@@ -161,8 +162,23 @@ def hook_message(est: dict[str, Any]) -> str:
 # ------------------------------------------------------------------ setup
 
 
-def setup_snippet() -> str:
-    exe = "tokentrail"
+def executable() -> str:
+    """The command Claude Code should run: this very tokentrail, by absolute path,
+    since a venv or pipx install is often not on the PATH Claude Code sees."""
+    import shutil
+    import sys
+
+    me = Path(sys.argv[0])
+    if me.name.startswith("tokentrail") and me.exists():
+        return str(me.resolve())
+    found = shutil.which("tokentrail")
+    return found or "tokentrail"
+
+
+def setup_snippet(exe: str = "") -> str:
+    exe = exe or executable()
+    if " " in exe:
+        exe = f'"{exe}"'
     return json.dumps({
         "statusLine": {"type": "command", "command": f"{exe} statusline"},
         "hooks": {"UserPromptSubmit": [

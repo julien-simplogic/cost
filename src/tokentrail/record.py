@@ -128,6 +128,18 @@ class CounterCheck:
             self.ours_input, self.ours_cache_read, self.ours_cache_write)
 
 
+def totals_match(checks: "list[CounterCheck]") -> bool:
+    """Input and cache summed over all models, ours vs the counter.
+
+    Summed, so that a model the counter names differently from the call
+    lines (e.g. with a context-size suffix) does not read as a mismatch;
+    per-model rows are kept for `tokentrail diagnose`.
+    """
+    def tot(attr: str) -> int:
+        return sum(getattr(c, attr) for c in checks)
+    return all(tot(f"source_{k}") == tot(f"ours_{k}") for k in ("input", "cache_read", "cache_write"))
+
+
 @dataclass
 class ParseStats:
     """What a collector read, what it ignored on purpose, what it could not read."""
@@ -138,6 +150,8 @@ class ParseStats:
     ignored: dict[str, int] = field(default_factory=dict)  # known record types we skip by design
     unreadable: dict[str, int] = field(default_factory=dict)  # bad JSON, unexpected shape
     unknown_types: dict[str, int] = field(default_factory=dict)  # types this version doesn't know
+    # unknown types that contain token-count fields: they may hold usage we miss
+    unknown_with_tokens: dict[str, int] = field(default_factory=dict)
     versions: dict[str, int] = field(default_factory=dict)
 
     def bump(self, bucket: dict[str, int], key: str, n: int = 1) -> None:
@@ -155,6 +169,7 @@ class ParseStats:
             (self.ignored, other.ignored),
             (self.unreadable, other.unreadable),
             (self.unknown_types, other.unknown_types),
+            (self.unknown_with_tokens, other.unknown_with_tokens),
             (self.versions, other.versions),
         ):
             for k, v in theirs.items():

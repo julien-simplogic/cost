@@ -75,24 +75,40 @@ On the session this tool was built in (Claude Code 2.1.288), it prints:
 ```
 1 sessions under ~/.claude/projects; 1 carry Claude Code's counter (cost-state).
                                      input      cache read     cache write        output
-Claude Code's counter                  230      25,290,661         388,268       170,375
-naive sum of every line                576      65,286,318         922,826       491,227
-one line per message.id                230      25,290,661         388,268       170,072
-naive / counter                      2.50x           2.58x           2.38x         2.88x
-Sessions where 'one line per message.id' equals the counter for input and cache: 1 of 1.
-Lines per call: mean 2.54, distribution 1 line: 8, 2 lines: 45, 3 lines: 47, 4 lines: 6, 5 lines: 1, 6 lines: 1.
+Claude Code's counter              145,076      50,078,149         604,102       251,777
+naive sum of every line              1,066     129,236,142       1,554,591       684,869
+one line per message.id                406      50,078,149         604,102       238,988
+naive / one per message.id           2.63x           2.58x           2.57x         2.87x
+Sessions where 'one line per message.id' equals the counter for input and cache: 0 of 1; above it (would mean overcounting): 0.
+Input and cache by model (counter vs one line per message.id):
+  claude-haiku-4-5-20251001                  598,157         453,487        -144,670
+  claude-opus-5-5                         50,229,170      50,229,170              +0
+A model the counter has more of usually ran inside a tool (WebFetch reading a page), which writes no call line.
+Lines per call: mean 2.58, distribution 1 line: 15, 2 lines: 58, 3 lines: 83, 4 lines: 12, 5 lines: 1, 6 lines: 1.
 Each ratio above is this lines-per-call figure, weighted by that column's tokens.
 ```
 
-**What this proves.** Summing the lines overcounts by the ratio shown, on your
-data. Keeping one line per `message.id` gives exactly Claude Code's own input
-and cache counts.
+**What this proves.** Summing the lines overcounts by the "naive / one per
+message.id" ratio, on your data. For the model that wrote the conversation,
+one line per `message.id` gives exactly Claude Code's own input and cache
+counts.
+
+**A second finding: the counter holds more than the lines.** Here, Haiku is
+144,670 tokens short. That is the session's two `WebFetch` calls. The tool has
+a small model read each fetched page, Claude Code counts that call, and no
+call line records it (the tool's result carries only bytes and a duration). So
+the call lines are a lower bound on what a session used. Counting *more* than
+the counter would mean a counting error. Counting *less* means usage that no
+call line records. tokentrail tells these two cases apart in every report and
+shows the unattributed part separately, instead of hiding it or spreading it
+over categories it can't be assigned to. `tokentrail diagnose <session>` gives
+the per-model detail.
 
 **What it does not prove.** That Claude Code's counter equals what you are
-billed: it is Claude Code's number, not Anthropic's invoice. Output also
-differs slightly (here 170,072 vs 170,375): sub-agent output is under-logged,
-[see below](#how-sure-are-these-numbers). If your Claude Code version writes
-no counter, the script says so, and nothing can be checked.
+billed: it is Claude Code's number, not Anthropic's invoice. Sub-agent output
+is under-logged, [see below](#how-sure-are-these-numbers). If your Claude Code
+version writes no counter (on one machine, versions up to 2.1.276 did not),
+the script says so, and nothing can be checked.
 
 ## Why
 
@@ -346,6 +362,7 @@ tokentrail report --since 2w --project shop --top 20
 tokentrail report --since all --json
 tokentrail report --logged-only         # output exactly as each call's own line logged it
 tokentrail check                        # per Claude Code version and per month: what to trust
+tokentrail diagnose <session>           # one session vs Claude Code's counter, numbers only
 tokentrail setup                        # the settings.json lines for the live display
 tokentrail estimate "add retries to the payment client"
 tokentrail estimate --file prompt.md --add src/payments.py --family refactor
