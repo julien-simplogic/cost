@@ -37,7 +37,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator, Optional
 
 from ..classify import guess_family
-from ..record import CounterCheck, FileEvent, ParseStats, Task, UsageRecord
+from ..record import CounterCheck, FileEvent, ParseStats, Task, UsageRecord, normalize_model
 
 SOURCE = "claude-code"
 VERIFIED_VERSION = "2.1.288"
@@ -589,27 +589,30 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta):
         series.append([len(before), ours_p, src_p])
     coverage["gap_series"] = series  # [calls before the snapshot, ours, counter] (input + cache)
 
+    # both sides keyed by the normalized model name, raw names kept for diagnose
+    coverage["counter_model_names"] = sorted(usage)
+    coverage["line_model_names"] = sorted({r.model for r in records if r.turn_id in covered})
     sums: dict[str, list[int]] = {}
     for r in records:
         if r.turn_id in covered:
-            acc = sums.setdefault(r.model, [0, 0, 0, 0, 0])
+            acc = sums.setdefault(normalize_model(r.model), [0, 0, 0, 0, 0])
             acc[0] += r.input_new
             acc[1] += r.input_cache_read
             acc[2] += r.input_cache_write
             acc[3] += r.output_logged if r.output_logged is not None else r.output_total
             acc[4] += r.output_total
+    counter: dict[str, list[int]] = {}
+    for name, u in usage.items():
+        if isinstance(u, dict):
+            acc = counter.setdefault(normalize_model(name), [0, 0, 0, 0])
+            for i, k in enumerate(("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "outputTokens")):
+                acc[i] += _int(u.get(k)) or 0
     checks = []
     # every model on either side: a model only one side names must show, not vanish
-    for model in list(usage) + [m for m in sums if m not in usage]:
-        u = usage.get(model)
-        u = u if isinstance(u, dict) else {}
+    for model in list(counter) + [m for m in sums if m not in counter]:
+        src = counter.get(model, [0, 0, 0, 0])
         ours = sums.get(model, [0, 0, 0, 0, 0])
-        checks.append(CounterCheck(
-            model,
-            _int(u.get("inputTokens")) or 0, _int(u.get("cacheReadInputTokens")) or 0,
-            _int(u.get("cacheCreationInputTokens")) or 0, _int(u.get("outputTokens")) or 0,
-            *ours,
-        ))
+        checks.append(CounterCheck(model, *src, *ours))
     return checks, coverage
 
 

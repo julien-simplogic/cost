@@ -123,7 +123,14 @@ How tokentrail turns this into a verdict, on the first line of every report:
   side only, the verdict is at best "Partly verified", and the model is named.
   (On one machine the counter said `claude-opus-5[1m]` where the call lines
   said `claude-opus-5`. An earlier version of the check skipped that model
-  silently and could have reported a match while ignoring most of the volume.)
+  silently and could have reported a match while ignoring most of the volume.
+  Names are now compared without bracketed qualifiers; `diagnose` shows them
+  as written.)
+- The counter side is always the session's **last** `cost-state` record.
+  Those records are cumulative snapshots, sometimes written twice in a row,
+  so adding them up would count the same usage several times. A test fails if
+  the comparison ever sums them. `tokentrail diagnose <session> --raw` prints
+  every record as written.
 - **MISMATCH** when tokentrail counts more than the counter, or when the gap
   grows snapshot after snapshot. Claude Code writes its counter at the end of
   each turn. A hidden call makes the gap jump between one or two snapshots; a

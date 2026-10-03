@@ -15,7 +15,30 @@ from .errors import TokentrailError
 from .record import counter_resets, gap_shape, totals_match
 
 
-def run(root: Path, prefix: str) -> str:
+def raw_counter_records(main: Path) -> list[str]:
+    """Every cost-state record of the file as written, with the timestamp of the line before it."""
+    out, last_ts = [], "?"
+    with main.open(encoding="utf-8", errors="replace") as fh:
+        for i, line in enumerate(fh):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if isinstance(obj.get("timestamp"), str):
+                last_ts = obj["timestamp"]
+            if obj.get("type") == "cost-state" and isinstance(obj.get("modelUsage"), dict):
+                for model, u in obj["modelUsage"].items():
+                    if isinstance(u, dict):
+                        out.append(
+                            f"  line {i:>6}  after {last_ts}  {model:30} in {u.get('inputTokens', 0):>12,}  "
+                            f"cache read {u.get('cacheReadInputTokens', 0):>15,}  "
+                            f"cache write {u.get('cacheCreationInputTokens', 0):>13,}  out {u.get('outputTokens', 0):>12,}")
+    return out
+
+
+def run(root: Path, prefix: str, raw: bool = False) -> str:
     sessions = claude_code.discover(root)
     hits = [sf for sf in sessions if sf.session_id.startswith(prefix)]
     if not hits:  # ids from `report --anonymize` are hashes of the real ones
@@ -50,6 +73,9 @@ def run(root: Path, prefix: str) -> str:
     if not res.checks:
         out.append("  no cost-state counter in this session: nothing to compare with")
         return "\n".join(out)
+    if cov.get("counter_model_names") != cov.get("line_model_names"):
+        out.append(f"  model names as written: counter {', '.join(cov.get('counter_model_names', []))}; "
+                   f"call lines {', '.join(cov.get('line_model_names', []))} (compared without [..] qualifiers)")
     out.append(f"  counter: {cov.get('counter_records', 0)} cost-state records; the last one is compared "
                f"with the {cov.get('calls_covered', 0)} calls made before it")
     out.append(f"    not compared: {cov.get('main_calls_after_counter', 0)} main calls and "
@@ -66,6 +92,10 @@ def run(root: Path, prefix: str) -> str:
             ("output", c.source_output, c.ours_output),
         ):
             out.append(f"  {c.model[:34]:34}{label:13}{src:>14,}{ours:>14,}{ours - src:>+16,}")
+    if raw and sf.main:
+        out.append("")
+        out.append("  raw cost-state records, as written (the comparison uses the LAST one, never a sum):")
+        out += raw_counter_records(sf.main)
     verdict = "match" if totals_match(res.checks) else "MISMATCH"
     out.append(f"  input + cache summed over models: {verdict}")
     series = cov.get("gap_series") or []

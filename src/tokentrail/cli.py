@@ -80,7 +80,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("event", choices=["prompt"], help="prompt: UserPromptSubmit")
     sub.add_parser("setup", help="print the settings.json lines that turn on the live display")
     s = sub.add_parser("diagnose", help="one session vs Claude Code's counter, numbers only (safe to paste)")
-    s.add_argument("session", help="session id or prefix")
+    s.add_argument("session", help="session id or prefix (the hashed ids of `report --anonymize` work too)")
+    s.add_argument("--raw", action="store_true", help="also print every cost-state record as written")
     return p
 
 
@@ -203,7 +204,7 @@ def _run(args) -> int:
         return 0
 
     if args.cmd == "diagnose":
-        print(diagnose.run(args.source_dir or paths.claude_code_dir(), args.session))
+        print(diagnose.run(args.source_dir or paths.claude_code_dir(), args.session, raw=args.raw))
         return 0
 
     if args.cmd == "setup":

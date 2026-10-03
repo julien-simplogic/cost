@@ -10,6 +10,7 @@ One record is one model call (one API request/response pair).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -126,6 +127,16 @@ class CounterCheck:
     def input_matches(self) -> bool:
         return (self.source_input, self.source_cache_read, self.source_cache_write) == (
             self.ours_input, self.ours_cache_read, self.ours_cache_write)
+
+
+def normalize_model(name: str) -> str:
+    """One model, whatever qualifier a side adds: "claude-opus-5[1m]" -> "claude-opus-5".
+
+    Claude Code's counter can name a model with a bracketed qualifier (the 1M
+    context window) where the call lines don't. Used for comparisons only;
+    prices and reports keep the name as written.
+    """
+    return re.sub(r"\[[^\]]*\]$", "", name.strip())
 
 
 def totals_match(checks: "list[CounterCheck]") -> bool:

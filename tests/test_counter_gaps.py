@@ -48,9 +48,8 @@ def test_counting_more_than_the_counter_is_an_alarm(env, capsys):
     assert "input +1 (+<0.01%)" in out
 
 
-def test_a_model_on_one_side_only_never_reads_as_verified(env, capsys):
-    # same usage, but the counter names the model with a context suffix: totals match,
-    # model by model they don't, so the verdict can't be "Verified"
+def test_a_context_qualifier_does_not_split_a_model(env, capsys):
+    # the counter says claude-opus-5[1m], the lines claude-opus-5: same model
     s = FakeSession(env.projects, model="claude-opus-5")
     s.prompt("x")
     s.call(new=2, write=9_000, out=100)
@@ -59,12 +58,28 @@ def test_a_model_on_one_side_only_never_reads_as_verified(env, capsys):
                                         "cacheCreationInputTokens": u[2], "outputTokens": u[3]}})
     s.write()
     [sf] = cc.discover(env.projects)
-    checks = {c.model: c for c in cc.parse_session(sf).checks}
-    assert set(checks) == {"claude-opus-5[1m]", "claude-opus-5"}  # neither side vanishes
+    res = cc.parse_session(sf)
+    assert [c.model for c in res.checks] == ["claude-opus-5"]
+    assert res.coverage["counter_model_names"] == ["claude-opus-5[1m]"]
+    main(["report", "--since", "all"])
+    assert capsys.readouterr().out.splitlines()[1].startswith("Verified")
+    main(["diagnose", s.session_id[:8]])
+    assert "compared without [..] qualifiers" in capsys.readouterr().out
+
+
+def test_a_model_on_one_side_only_never_reads_as_verified(env, capsys):
+    # totals match, but the counter attributes the usage to another model
+    s = FakeSession(env.projects, model="claude-opus-5")
+    s.prompt("x")
+    s.call(new=2, write=9_000, out=100)
+    u = s.true_usage["claude-opus-5"]
+    s.cost_state({"claude-sonnet-5": {"inputTokens": u[0], "cacheReadInputTokens": u[1],
+                                      "cacheCreationInputTokens": u[2], "outputTokens": u[3]}})
+    s.write()
     main(["report", "--since", "all"])
     banner = capsys.readouterr().out.splitlines()[1]
     assert banner.startswith("Partly verified: totals match Claude Code's counter, but not model by model")
-    assert "(not compared): claude-opus-5[1m], claude-opus-5." in banner
+    assert "(not compared): claude-sonnet-5, claude-opus-5." in banner
 
 
 def test_verified_is_unreachable_with_a_model_on_one_side():
@@ -200,3 +215,23 @@ def test_diagnose_accepts_anonymized_ids_and_finds_sibling_files(env, capsys):
     out = capsys.readouterr().out
     assert out.startswith(f"session {s.session_id[:8]}")
     assert "1 other session file(s) in this project carry this session's id (0f0f0f0f)" in out
+
+
+def test_the_counter_side_is_the_last_snapshot_never_a_sum(env, capsys):
+    # snapshots are cumulative and Claude Code sometimes writes the same one twice
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(new=2, write=10_000)
+    s.counter()
+    s.counter()  # written twice in a row, as observed in a real transcript
+    s.call(read=10_000, write=500)
+    s.counter()
+    s.write()
+    [sf] = cc.discover(env.projects)
+    [c] = cc.parse_session(sf).checks
+    last = s.true_usage["claude-opus-5-5"]
+    assert (c.source_input, c.source_cache_read, c.source_cache_write) == tuple(last[:3])
+    assert (c.ours_input, c.ours_cache_read, c.ours_cache_write) == tuple(last[:3])
+    main(["diagnose", s.session_id[:8], "--raw"])
+    out = capsys.readouterr().out
+    assert out.count("cache write") >= 3 and "uses the LAST one, never a sum" in out

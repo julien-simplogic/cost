@@ -15,11 +15,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 FIELDS = [("input_tokens", "inputTokens"), ("cache_read_input_tokens", "cacheReadInputTokens"),
           ("cache_creation_input_tokens", "cacheCreationInputTokens"), ("output_tokens", "outputTokens")]
+
+
+def norm(model) -> str:
+    """claude-opus-5[1m] and claude-opus-5 are one model: drop a bracketed qualifier."""
+    return re.sub(r"\[[^\]]*\]$", "", str(model))
 
 
 def lines(path: Path):
@@ -63,12 +69,17 @@ def session(main: Path):
         if not u:
             continue
         model, mid, usage = u
+        model = norm(model)
         n = naive.setdefault(model, [0, 0, 0, 0])
         for i, (k, _) in enumerate(FIELDS):
             n[i] += usage.get(k) or 0
         grouped.setdefault(model, {})[mid] = usage  # one line per message.id
         lines_per_call[mid] = lines_per_call.get(mid, 0) + 1
-    counter = {m: [u.get(k) or 0 for _, k in FIELDS] for m, u in records[stop]["modelUsage"].items()}
+    counter = {}
+    for m, u in records[stop]["modelUsage"].items():
+        acc = counter.setdefault(norm(m), [0, 0, 0, 0])
+        for i, (_, k) in enumerate(FIELDS):
+            acc[i] += (u.get(k) or 0) if isinstance(u, dict) else 0
     grouped = {m: [sum(u.get(k) or 0 for u in ids.values()) for k, _ in FIELDS] for m, ids in grouped.items()}
     return counter, naive, grouped, list(lines_per_call.values())
 
