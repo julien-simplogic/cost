@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .collectors import claude_code
 from .errors import TokentrailError
-from .record import counter_resets, gap_shape, totals_match
+from .record import counter_resets, gap_shape, increments, totals_match
 
 
 def raw_counter_records(main: Path) -> list[str]:
@@ -96,7 +96,7 @@ def run(root: Path, prefix: str, raw: bool = False) -> str:
         out.append("")
         out.append("  raw cost-state records, as written (the comparison uses the LAST one, never a sum):")
         out += raw_counter_records(sf.main)
-    verdict = "match" if totals_match(res.checks) else "MISMATCH"
+    verdict = "equal" if totals_match(res.checks) else "different (absolute totals; see what each side added between snapshots)"
     out.append(f"  input + cache summed over models: {verdict}")
     series = cov.get("gap_series") or []
     if series:
@@ -108,9 +108,32 @@ def run(root: Path, prefix: str, raw: bool = False) -> str:
             note = "   <- counter went DOWN: Claude Code restarted counting" if prev is not None and src < prev else ""
             out.append(f"  {i:>4}{calls:>14,}{ours:>18,}{src:>18,}{ours - src:>+18,}{note}")
             prev = src
+        inc = increments(series)
+        if inc["pairs"]:
+            d = inc["ours"] - inc["counter"]
+            out.append(f"  added between snapshots of one run: ours +{inc['ours']:,}, counter +{inc['counter']:,} "
+                       f"({d:+,})" + ("  <- we count MORE: unexplained" if d > 0 else ""))
+        if inc["offset"]:
+            out.append(f"  at the first snapshot the counter is {inc['offset']:+,} away from this file "
+                       + ("(usage carried in from outside it)" if inc["offset"] > 0 else "(it covers fewer calls)"))
+        fs = cov.get("field_series") or []
+        runs = [(a, b) for a, b in zip(fs, fs[1:]) if sum(b[2][:3]) >= sum(a[2][:3])]
+        if runs:
+            out.append("  added between snapshots of one run, field by field (does the counter count like us?):")
+            out.append(f"    {'field':12}{'ours':>16}{'counter':>16}{'ours - counter':>16}")
+            for i, label in enumerate(("input", "cache read", "cache write", "output")):
+                o = sum(b[1][i] - a[1][i] for a, b in runs)
+                c = sum(b[2][i] - a[2][i] for a, b in runs)
+                out.append(f"    {label:12}{o:>+16,}{c:>+16,}{o - c:>+16,}")
+        m = cov.get("counter_equals_last_calls")
+        if m:
+            out.append(f"  the last counter equals EXACTLY the last {m['calls']} of {m['of']} calls before it "
+                       f"(input, cache read, cache write), from {m['since']}: it counts only a final run")
+        elif series and series[-1][1] > series[-1][2]:
+            out.append("  no run of final calls adds up exactly to the last counter")
         sh = gap_shape(series)
         out.append(f"  gap shape: {sh['kind']}"
-                   + (f" (moved between {sh['steps']} of {sh['snapshots']} snapshots)" if sh.get("steps") else "")
+                   + (f" (moved in {sh['steps']} of {sh['intervals']} intervals)" if sh.get("steps") else "")
                    + f"; counter restarts: {counter_resets(series)}")
     return "\n".join(out)
 

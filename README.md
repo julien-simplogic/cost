@@ -131,8 +131,14 @@ How tokentrail turns this into a verdict, on the first line of every report:
   so adding them up would count the same usage several times. A test fails if
   the comparison ever sums them. `tokentrail diagnose <session> --raw` prints
   every record as written.
-- **MISMATCH** when tokentrail counts more than the counter, or when the gap
-  grows snapshot after snapshot. Claude Code writes its counter at the end of
+- **Could not verify** when tokentrail counts more than the counter between
+  two snapshots of one run, or when the gap grows interval after interval.
+  This says the totals are unverified, not which side is wrong: what the
+  counter means across Claude Code versions is not documented.
+- The counter belongs to a run of Claude Code, not to a file. It can start
+  with usage carried in from outside the file, or restart at zero when a
+  session is resumed. So what is compared is what both sides *added* between
+  two snapshots of the same run. That difference cancels both effects. Claude Code writes its counter at the end of
   each turn. A hidden call makes the gap jump between one or two snapshots; a
   counting error makes it grow at every one. Each disagreeing session shows
   its gap with sign, size and shape. When the counter goes *down* between two

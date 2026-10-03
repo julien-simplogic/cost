@@ -10,7 +10,7 @@ from typing import Any, Optional
 from .analysis import Row, cache_events, enrich, group_tasks
 from .classify import CATEGORIES, CATEGORY_LABELS
 from .prices import PriceTable
-from .record import counter_resets, gap_shape
+from .record import counter_resets, gap_shape, increments
 from .store import Store
 
 
@@ -179,14 +179,17 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         src = sum(ic(c, "source") for c in cs)
         ours = sum(ic(c, "ours") for c in cs)
         cov = json.loads(cs[0]["coverage"] or "{}")
+        status, inc, shape = session_status(cov)
         mismatched.append({
+            "status": status,
+            "increments": inc,
             "session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
             "version": cs[0]["version"],
             "input_gap": ours - src,  # signed: positive = we count more than the counter
             "input_gap_pct": 100 * (ours - src) / src if src else None,
             "output_gap": sum(c["ours_output"] for c in cs) - sum(c["source_output"] for c in cs),
-            "shape": gap_shape(cov.get("gap_series") or []),
-            "counter_resets": counter_resets(cov.get("gap_series") or []),
+            "shape": shape,
+            "counter_resets": inc["restarts"],
             "calls_after_counter": cov.get("main_calls_after_counter", 0) + cov.get("subagent_calls_after_counter", 0),
             "subagent_calls_unlinked": cov.get("subagent_calls_unlinked", 0),
             "models_counter_only": counter_only,
@@ -197,17 +200,18 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
     # Counting MORE than Claude Code is an error whatever its shape. Counting less is
     # usage no call line records only if the gap appeared at a few moments (hidden
     # calls); a gap that grows at every snapshot is a counting error too.
-    over = [m for m in mismatched if m["input_gap"] > 0]
-    spread = [m for m in mismatched if m["input_gap"] < 0 and m["shape"]["kind"] == "spread"]
-    unknown = [m for m in mismatched if m["input_gap"] < 0 and m["shape"]["kind"] == "unknown"]
+    def n(status: str) -> int:
+        return sum(1 for m in mismatched if m["status"] == status)
     return {
         "sessions_in_period": len(session_keys),
         "sessions_checkable": len(by_session),
         "sessions_input_exact": len(input_ok),
-        "sessions_over": len(over),
-        "sessions_spread": len(spread),
-        "sessions_shape_unknown": len(unknown),
-        "sessions_under": len(mismatched) - len(over),
+        "sessions_over": n("over"),
+        "sessions_spread": n("spread"),
+        "sessions_increments_ok": n("increments_ok"),
+        "sessions_single": n("single"),
+        "sessions_restart": n("restart"),
+        "sessions_under": len(mismatched),
         "models_counter_only": sorted(one_sided["counter"]),
         "models_lines_only": sorted(one_sided["lines"]),
         "counter_input": sum(ic(c, "source") for c in all_c),
@@ -217,6 +221,25 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         "ours_output_logged": sum(c["ours_output_logged"] for c in all_c),
         "ours_output": sum(c["ours_output"] for c in all_c),
     }
+
+
+def session_status(cov: dict) -> tuple[str, dict, dict]:
+    """How a session that disagrees with Claude Code's counter compares, snapshot to snapshot.
+
+    Claude Code's counter belongs to a run, not to a file (it can carry usage in, or
+    restart when a session is resumed): what was added between two snapshots of one
+    run is the reliable reference.
+    """
+    series = cov.get("gap_series") or []
+    inc = increments(series)
+    shape = gap_shape(series)
+    if inc["pairs"]:
+        if inc["ours"] > inc["counter"]:
+            return "over", inc, shape  # more than Claude Code within one run: unexplained
+        if shape["kind"] == "spread":
+            return "spread", inc, shape
+        return "increments_ok", inc, shape
+    return ("restart" if inc["restarts"] else "single"), inc, shape
 
 
 def _fmt_pct(p: Optional[float]) -> str:
@@ -372,9 +395,11 @@ def render(rep: dict[str, Any]) -> str:
 def verification_banner(ck: dict[str, Any]) -> str:
     """First thing a reader sees: are these totals checked, how did it go, which way are they wrong?
 
-    Hard rules: "Verified" only when every checked session matches to the token
-    AND every model is on both sides; counting more than the counter, or a gap
-    that grows at every snapshot, is a MISMATCH.
+    Hard rules: "Verified" only when every checked session matches Claude Code's
+    counter to the token AND every model is on both sides. Counting more than the
+    counter between two snapshots of one run, or a gap that keeps growing from
+    interval to interval, makes the totals unverifiable. It does not say which
+    side is wrong: the counter's meaning across versions is not documented.
     """
     n, k, ok = ck["sessions_in_period"], ck["sessions_checkable"], ck["sessions_input_exact"]
     over, spread = ck.get("sessions_over", 0), ck.get("sessions_spread", 0)
@@ -382,22 +407,32 @@ def verification_banner(ck: dict[str, Any]) -> str:
     if k == 0:
         return (f"NOT VERIFIED: none of these {n} sessions carries Claude Code's own counter (cost-state), so "
                 "nothing checks the totals below. They miss what call lines never record, so read them as a minimum.")
+    unknown_meaning = ("Which side is wrong is not established: what Claude Code's counter means across its "
+                       "versions is not documented. See 'How sure' at the end.")
     if over:
-        return (f"MISMATCH: in {over} of {k} checkable sessions tokentrail counts MORE input than Claude Code's "
-                "own counter, which means a counting error. Do not trust these totals; see 'How sure' at the end.")
+        return (f"COULD NOT VERIFY: in {over} of {k} checkable sessions these totals could not be verified against "
+                "Claude Code's counter: between two of its snapshots tokentrail counts more than it, which no "
+                f"known cause explains. {unknown_meaning}")
     if spread:
-        return (f"MISMATCH: in {spread} of {k} checkable sessions the gap with Claude Code's counter grows at "
-                "snapshot after snapshot. Hidden calls make it jump at a few moments; a steady growth means a "
-                "counting error. Do not trust these totals; see 'How sure' at the end.")
+        return (f"COULD NOT VERIFY: in {spread} of {k} checkable sessions these totals could not be verified against "
+                "Claude Code's counter: the gap grows from interval to interval, which hidden calls don't "
+                f"explain. {unknown_meaning}")
     unchecked = f"; {n - k} sessions carry no counter and are unchecked" if k < n else ""
     names = (" Models seen on one side only (not compared): " + ", ".join(one_sided) + ".") if one_sided else ""
-    if ck.get("sessions_under", 0):
-        pct = 100 * ck["lines_input"] / ck["counter_input"] if ck["counter_input"] else 0
-        unk = ck.get("sessions_shape_unknown", 0)
-        shape = (f" In {unk} of them a single snapshot can't tell a hidden call from an error." if unk else "")
-        return (f"Partly verified: never more than Claude Code's counter, exact in {ok} of {k} checked sessions; "
-                f"the call lines hold {pct:.1f}% of its input, the rest arrived at a few moments (calls no line "
-                f"records). The totals below are a MINIMUM.{shape}{names}{unchecked}")
+    inc_ok, single, restart = (ck.get("sessions_increments_ok", 0), ck.get("sessions_single", 0),
+                               ck.get("sessions_restart", 0))
+    if inc_ok or single or restart:
+        parts = [f"exact in {ok}"]
+        if inc_ok:
+            parts.append(f"consistent snapshot to snapshot in {inc_ok} (the counter started above or below "
+                         "this file: usage carried in, or a resumed run)")
+        if restart:
+            parts.append(f"counter restarted in {restart}, nothing comparable")
+        if single:
+            parts.append(f"a single snapshot that disagrees in {single}, which can't be checked")
+        return (f"Partly verified, {k} of {n} sessions carry Claude Code's counter: " + "; ".join(parts) + ". "
+                "Never more than the counter between snapshots. The totals below are a MINIMUM: some usage "
+                f"(tools' own model calls) is recorded by no call line.{names}{unchecked}")
     if one_sided:
         return f"Partly verified: totals match Claude Code's counter, but not model by model.{names}{unchecked}"
     if k < n:
@@ -466,17 +501,25 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
             for m in ck["mismatched"][:15]:
                 pct = _fmt_pct(m["input_gap_pct"])
                 extra = []
+                inc, sh = m["increments"], m["shape"]
+                if inc["pairs"]:
+                    d = inc["ours"] - inc["counter"]
+                    pct = _fmt_pct(100 * d / inc["counter"]) if inc["counter"] else "n/a"
+                    extra.append(f"between snapshots: ours +{inc['ours']:,} vs counter +{inc['counter']:,} "
+                                 f"({d:+,}, {pct}" + (", we count MORE: unexplained)" if d > 0 else ")"))
+                if inc["offset"]:
+                    extra.append(f"at the first snapshot the counter was {inc['offset']:+,} away from this file "
+                                 + ("(usage carried in from outside it)" if inc["offset"] > 0 else
+                                    "(it covered fewer calls: a restarted run)"))
                 if m["counter_resets"]:
-                    extra.append(f"Claude Code's counter went DOWN {m['counter_resets']} time(s): it restarted "
-                                 "counting (e.g. a resumed session), so it covers fewer calls than the file")
-                sh = m["shape"]
-                if sh["kind"] == "concentrated":
-                    extra.append(f"gap appeared between {sh['steps']} of {sh['snapshots']} snapshots (hidden calls)")
-                elif sh["kind"] == "spread":
-                    extra.append(f"GAP GROWS between {sh['steps']} of {sh['snapshots']} snapshots, "
-                                 f"over {sh.get('calls_in_steps', 0)} calls (counting error)")
-                elif sh["kind"] == "unknown":
-                    extra.append("one snapshot only: shape unknown")
+                    extra.append(f"counter went DOWN {m['counter_resets']} time(s): Claude Code restarted counting")
+                if sh["kind"] == "spread":
+                    extra.append(f"GAP GROWS in {sh['steps']} of {sh['intervals']} intervals (unexplained)")
+                elif sh["kind"] == "concentrated":
+                    extra.append(f"gap moved in {sh['steps']} of {sh['intervals']} intervals (hidden calls)")
+                elif m["status"] == "single":
+                    extra.append("a single snapshot: can't tell carried-in usage, a restart or an error apart "
+                                 "(`tokentrail diagnose` looks for an exact match)")
                 if m["calls_after_counter"]:
                     extra.append(f"{m['calls_after_counter']} calls after the counter (not compared)")
                 if m["subagent_calls_unlinked"]:
@@ -528,6 +571,22 @@ def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
             v["input_exact"] += int(exact)
             v["output_gap"] += sum(c["source_output"] - c["ours_output"] for c in cs)
 
+    # Does the counter read the same in every version? Sessions that ran entirely on
+    # one version answer it without resumes across upgrades muddying the comparison.
+    single: dict[str, dict[str, int]] = {}
+    for key, s in sessions.items():
+        cs = checks.get(key)
+        st = json.loads(s["stats"])
+        vs = st.get("versions") or {}
+        if not cs or len(vs) != 1:
+            continue
+        d = single.setdefault(next(iter(vs)), defaultdict(int))
+        d["sessions"] += 1
+        if _rows_match(cs):
+            d["exact"] += 1
+        else:
+            d[session_status(json.loads(s["coverage"] or "{}"))[0]] += 1
+
     months: dict[str, dict[str, float]] = {}
     for r in rows:
         m = months.setdefault(r.ts[:7], defaultdict(float))
@@ -539,6 +598,7 @@ def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
         m["recovered"] += r.recovered
     return {
         "versions": {k: dict(v) for k, v in sorted(versions.items())},
+        "single_version": {k: dict(v) for k, v in sorted(single.items())},
         "months": {k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in sorted(months.items())},
     }
 
@@ -555,6 +615,18 @@ def render_check(chk: dict[str, Any]) -> str:
     out.append("  with counter: sessions carrying Claude Code's own cost-state counter; input exact: of those,")
     out.append("  sessions where input and cache match it to the token; output gap: output the counter has")
     out.append("  and the per-call lines don't (sub-agent calls logged mid-stream).")
+    out.append("")
+    out.append("Sessions that ran on a single version, with a counter (does the counter read the same everywhere?)")
+    rows = [
+        [v, str(d.get("sessions", 0)), str(d.get("exact", 0)), str(d.get("increments_ok", 0)),
+         str(d.get("single", 0) + d.get("restart", 0)), str(d.get("over", 0) + d.get("spread", 0))]
+        for v, d in chk.get("single_version", {}).items()
+    ]
+    if rows:
+        out += _table(["version", "sessions", "exact", "consistent between snapshots", "can't check",
+                       "unexplained"], rows, {1, 2, 3, 4, 5})
+    else:
+        out.append("  none: every session with a counter mixes several Claude Code versions")
     out.append("")
     out.append("By month (compare with your plan's usage page)")
     rows = [

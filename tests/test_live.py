@@ -67,7 +67,7 @@ def test_statusline_raises_problems(env, capsys, monkeypatch):
     line = capsys.readouterr().out
     assert "! cache cold: next message re-caches 20k" in line
     assert "! 2 cache misses (last: tools_changed)" in line
-    assert "! COUNTER MISMATCH: run tokentrail check" in line
+    assert "! totals disagree with Claude Code's counter: run tokentrail check" in line
 
 
 def test_statusline_detects_a_miss_itself_on_versions_without_prompt_cache(env, capsys, monkeypatch):

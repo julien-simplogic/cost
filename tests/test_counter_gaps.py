@@ -32,20 +32,56 @@ def test_side_calls_counted_only_by_claude_code_are_shown_not_called_a_bug(env, 
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
     banner = out.splitlines()[1]
-    assert banner.startswith("Partly verified: never more than Claude Code's counter")
+    assert banner.startswith("Partly verified, 1 of 1 sessions carry Claude Code's counter")
+    assert "a single snapshot that disagrees in 1, which can't be checked" in banner  # one cost-state only
     assert "The totals below are a MINIMUM" in banner
-    assert "a single snapshot can't tell a hidden call from an error" in banner  # one cost-state only
     assert "one side only (not compared): claude-haiku-4-5-20251001" in banner
     assert "MISMATCH" not in out
     assert "holds 144k input tokens (cache included) that no call line records" in out
 
 
-def test_counting_more_than_the_counter_is_an_alarm(env, capsys):
-    _session(env, shrink=1)  # the counter has 1 input token less than our lines: we overcount
+def test_more_than_a_single_snapshot_is_not_proof_of_an_error(env, capsys):
+    # one snapshot below our lines: an overcount, or a run restarted just before it?
+    _session(env, shrink=1)
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert out.splitlines()[1].startswith("MISMATCH: in 1 of 1 checkable sessions tokentrail counts MORE")
-    assert "input +1 (+<0.01%)" in out
+    assert out.splitlines()[1].startswith("Partly verified")
+    assert "a single snapshot: can't tell carried-in usage, a restart or an error apart" in out
+
+
+def test_counting_more_between_two_snapshots_is_an_alarm(env, capsys):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(new=2, write=20_000)
+    s.counter()  # exact
+    s.call(read=20_000, write=1_000)
+    u = s.true_usage["claude-opus-5-5"]
+    s.cost_state({"claude-opus-5-5": {"inputTokens": u[0], "cacheReadInputTokens": u[1] - 700,
+                                      "cacheCreationInputTokens": u[2], "outputTokens": u[3]}})
+    s.write()
+    main(["report", "--since", "all"])
+    out = capsys.readouterr().out
+    banner = out.splitlines()[1]
+    assert banner.startswith("COULD NOT VERIFY: in 1 of 1 checkable sessions these totals could not be verified")
+    assert "Which side is wrong is not established" in banner and "Do not trust" not in banner
+    assert "we count MORE: unexplained" in out
+
+
+def test_usage_carried_into_the_counter_is_told_apart(env, capsys):
+    # the counter starts 1M above this file, then moves exactly with it
+    s = FakeSession(env.projects)
+    for turn in range(3):
+        s.prompt(f"t{turn}")
+        s.call(new=2, read=10_000 * turn, write=10_000)
+        u = s.true_usage["claude-opus-5-5"]
+        s.cost_state({"claude-opus-5-5": {"inputTokens": u[0], "cacheReadInputTokens": u[1] + 1_000_000,
+                                          "cacheCreationInputTokens": u[2], "outputTokens": u[3]}})
+    s.write()
+    main(["report", "--since", "all"])
+    out = capsys.readouterr().out
+    assert "consistent snapshot to snapshot in 1" in out.splitlines()[1]
+    assert "COULD NOT VERIFY" not in out
+    assert "counter was +1,000,000 away from this file (usage carried in from outside it)" in out
 
 
 def test_a_context_qualifier_does_not_split_a_model(env, capsys):
@@ -115,22 +151,24 @@ def test_a_gap_that_appears_once_is_a_hidden_call(env, capsys):
     _snapshots(env, lambda t: 50_000 if t >= 2 else 0)  # one jump, then stable
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert out.splitlines()[1].startswith("Partly verified: never more")
-    assert "gap appeared between 1 of 5 snapshots (hidden calls)" in out
+    assert "consistent snapshot to snapshot in 1" in out.splitlines()[1]
+    assert "gap moved in 1 of 4 intervals (hidden calls)" in out
 
 
 def test_a_gap_that_grows_at_every_snapshot_is_a_counting_error(env, capsys):
     _snapshots(env, lambda t: 3_000 * (t + 1))  # grows every turn
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert out.splitlines()[1].startswith("MISMATCH: in 1 of 1 checkable sessions the gap")
-    assert "GAP GROWS between 5 of 5 snapshots" in out
+    assert out.splitlines()[1].startswith("COULD NOT VERIFY: in 1 of 1 checkable sessions")
+    assert "the gap grows from interval to interval" in out.splitlines()[1]
+    assert "GAP GROWS in 4 of 4 intervals" in out
 
 
 def test_gap_shape_rules():
     from tokentrail.record import gap_shape
 
-    assert gap_shape([])["kind"] == "none"
+    assert gap_shape([])["kind"] == "unknown"
+    assert gap_shape([[3, -5], [6, -9]])["kind"] == "too few intervals"  # 1 interval proves nothing
     assert gap_shape([[3, 0], [6, 0]])["kind"] == "none"
     assert gap_shape([[3, -100]])["kind"] == "unknown"
     assert gap_shape([[3, 0], [6, -9000], [9, -9000], [12, -9000]])["kind"] == "concentrated"
@@ -159,7 +197,7 @@ def test_diagnose_prints_numbers_and_model_names_only(env, capsys):
         "inputTokens": 500, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "outputTokens": 50}})
     assert main(["diagnose", s.session_id[:8]]) == 0
     out = capsys.readouterr().out
-    assert "claude-haiku-4-5-20251001" in out and "-500" in out and "MISMATCH" in out
+    assert "claude-haiku-4-5-20251001" in out and "-500" in out and "summed over models: different" in out
     assert "Zorblax" not in out and "BillingGateway" not in out and "example.com" not in out
 
 
@@ -194,8 +232,8 @@ def test_a_counter_that_goes_down_is_reported_as_a_restart(env, capsys):
     s.write()
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert out.splitlines()[1].startswith("MISMATCH: in 1 of 1 checkable sessions tokentrail counts MORE")
-    assert "counter went DOWN 1 time(s): it restarted counting" in out
+    assert "counter restarted in 1, nothing comparable" in out.splitlines()[1]
+    assert "counter went DOWN 1 time(s): Claude Code restarted counting" in out
     assert main(["diagnose", s.session_id[:8]]) == 0
     d = capsys.readouterr().out
     assert "<- counter went DOWN: Claude Code restarted counting" in d and "counter restarts: 1" in d
@@ -235,3 +273,31 @@ def test_the_counter_side_is_the_last_snapshot_never_a_sum(env, capsys):
     main(["diagnose", s.session_id[:8], "--raw"])
     out = capsys.readouterr().out
     assert out.count("cache write") >= 3 and "uses the LAST one, never a sum" in out
+
+
+def test_diagnose_finds_a_counter_that_covers_only_the_last_run(env, capsys):
+    # resumed session: the file has 3 calls, the new run's counter only the last one
+    s = FakeSession(env.projects)
+    s.prompt("first run")
+    s.call(new=2, write=40_000)
+    s.call(new=2, read=40_000, write=3_000)
+    s.prompt("resumed")
+    s.call(new=3, read=43_000, write=7_000)
+    s.cost_state({"claude-opus-5-5[1m]": {"inputTokens": 3, "cacheReadInputTokens": 43_000,
+                                          "cacheCreationInputTokens": 7_000, "outputTokens": 100}})
+    s.write()
+    main(["diagnose", s.session_id[:8]])
+    out = capsys.readouterr().out
+    assert "equals EXACTLY the last 1 of 3 calls before it" in out
+
+
+def test_diagnose_says_when_no_final_run_matches(env, capsys):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(new=2, write=40_000)
+    s.call(new=2, read=40_000, write=3_000)
+    s.cost_state({"claude-opus-5-5": {"inputTokens": 3, "cacheReadInputTokens": 41_000,
+                                      "cacheCreationInputTokens": 3_000, "outputTokens": 100}})
+    s.write()
+    main(["diagnose", s.session_id[:8]])
+    assert "no run of final calls adds up exactly to the last counter" in capsys.readouterr().out

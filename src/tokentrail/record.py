@@ -153,32 +153,66 @@ def totals_match(checks: "list[CounterCheck]") -> bool:
 
 def counter_resets(series: "list[list[int]]") -> int:
     """Snapshots where Claude Code's counter went DOWN: it restarted counting
-    (a new process on the same session file, e.g. a resumed session)."""
+    (a new run of Claude Code on the same session file, e.g. a resumed session)."""
     vals = [e[2] for e in series if len(e) == 3]
     return sum(1 for a, b in zip(vals, vals[1:]) if b < a)
 
 
-def gap_shape(series: "list[list[int]]") -> dict:
-    """How a session's gap with Claude Code's counter built up, snapshot by snapshot.
+def increments(series: "list[list[int]]") -> dict:
+    """Compare what was added between consecutive snapshots of the same counting run.
 
-    series: [calls made before the snapshot, ours - counter] per cost-state snapshot.
-    concentrated: the gap appeared between at most 2 snapshots (or 90% of it did):
-                  the signature of a few hidden calls.
-    spread:       it grew between many snapshots: the signature of a counting error.
-    unknown:      a single snapshot, or no gap at all.
+    Claude Code's counter belongs to a run, not to a file: it can start with usage
+    carried in from outside the file, or restart at zero when the session is
+    resumed. Differences between two snapshots of one run cancel both, so they
+    are the reliable reference. Pairs where the counter went down are skipped.
+
+    series: [calls before the snapshot, ours, counter] per snapshot (input + cache).
     """
-    series = [[e[0], e[1] - e[2]] if len(e) == 3 else list(e) for e in series]
-    if not series or all(g == 0 for _, g in series):
-        return {"kind": "none", "steps": 0, "snapshots": len(series)}
-    if len(series) < 2:
-        return {"kind": "unknown", "steps": 0, "snapshots": 1}
-    deltas = [series[0][1]] + [b[1] - a[1] for a, b in zip(series, series[1:])]
-    calls = [series[0][0]] + [b[0] - a[0] for a, b in zip(series, series[1:])]
-    moved = [(abs(d), c) for d, c in zip(deltas, calls) if d != 0]
+    pairs = [(b[0] - a[0], b[1] - a[1], b[2] - a[2])
+             for a, b in zip(series, series[1:]) if len(a) == 3 and len(b) == 3 and b[2] >= a[2]]
+    first = series[0] if series else None
+    return {
+        "pairs": len(pairs),
+        "calls": sum(p[0] for p in pairs),
+        "ours": sum(p[1] for p in pairs),
+        "counter": sum(p[2] for p in pairs),
+        "deltas": [p[1] - p[2] for p in pairs],  # per interval, ours - counter
+        "calls_per_pair": [p[0] for p in pairs],
+        # counter minus ours at the first snapshot: > 0 carried in, < 0 not covered
+        "offset": (first[2] - first[1]) if first and len(first) == 3 else None,
+        "restarts": counter_resets(series),
+    }
+
+
+def gap_shape(series: "list[list[int]]") -> dict:
+    """How the gap with Claude Code's counter moved between snapshots of one run.
+
+    The gap already present at the first snapshot is left out (it can be usage
+    the counter carried in), and so are intervals where the counter restarted.
+    concentrated: the gap moved in at most 2 intervals, or 90% of it did: a few
+                  hidden calls.
+    spread:       it moved in many intervals: the signature of a counting error.
+    none:         it never moved: increments match to the token.
+    unknown:      a single snapshot, nothing to compare between.
+    """
+    if series and len(series[0]) == 2:  # legacy form: [calls, ours - counter]
+        series = [[c, g, 0] for c, g in series]
+        inc = {"deltas": [b[1] - a[1] for a, b in zip(series, series[1:])],
+               "calls_per_pair": [b[0] - a[0] for a, b in zip(series, series[1:])], "pairs": len(series) - 1}
+    else:
+        inc = increments(series)
+    if len(series) < 2 or inc["pairs"] == 0:
+        return {"kind": "unknown", "steps": 0, "intervals": 0}
+    if inc["pairs"] < 3 and any(inc["deltas"]):
+        # one or two intervals: any gap is trivially "concentrated", which says nothing
+        return {"kind": "too few intervals", "steps": sum(1 for d in inc["deltas"] if d), "intervals": inc["pairs"]}
+    moved = [(abs(d), c) for d, c in zip(inc["deltas"], inc["calls_per_pair"]) if d != 0]
+    if not moved:
+        return {"kind": "none", "steps": 0, "intervals": inc["pairs"]}
     total = sum(d for d, _ in moved)
     top2 = sum(sorted((d for d, _ in moved), reverse=True)[:2])
     kind = "concentrated" if len(moved) <= 2 or top2 >= 0.9 * total else "spread"
-    return {"kind": kind, "steps": len(moved), "snapshots": len(series),
+    return {"kind": kind, "steps": len(moved), "intervals": inc["pairs"],
             "calls_in_steps": sum(c for _, c in moved)}
 
 

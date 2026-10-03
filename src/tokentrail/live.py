@@ -106,7 +106,7 @@ def statusline(raw_stdin: str) -> str:
                 and last.input_total >= 0.5 * prev.input_total:
             alerts.append("cache missed on the last call")
     if res.checks and not totals_match(res.checks):
-        alerts.append("COUNTER MISMATCH: run tokentrail check")
+        alerts.append("totals disagree with Claude Code's counter: run tokentrail check")
     if res.stats.not_understood:
         alerts.append(f"{res.stats.not_understood} lines unread: run tokentrail check")
     if unpriced:

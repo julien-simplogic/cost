@@ -168,3 +168,13 @@ def test_user_price_file_wins(env, capsys):
     assert table.path == str(user)
     assert table.lookup("claude-opus-5-5").input == 40.0
     assert str(table.verified_on) == "2026-10-01"
+
+
+def test_a_new_parser_revision_reads_unchanged_files_again(env, store, monkeypatch):
+    from tokentrail.collectors import claude_code
+
+    _week(env.projects)
+    assert ingest_claude_code(store, env.projects).sessions_parsed == 2
+    assert ingest_claude_code(store, env.projects).sessions_parsed == 0  # files unchanged
+    monkeypatch.setattr(claude_code, "PARSER_REVISION", claude_code.PARSER_REVISION + 1)
+    assert ingest_claude_code(store, env.projects).sessions_parsed == 2  # new code: read again

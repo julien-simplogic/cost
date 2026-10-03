@@ -19,7 +19,7 @@ class IngestResult:
 
 
 def _signature(files: list[Path]) -> str:
-    h = hashlib.sha256()
+    h = hashlib.sha256(f"parser {claude_code.PARSER_REVISION}\n".encode())
     for f in sorted(files):
         try:
             st = f.stat()
