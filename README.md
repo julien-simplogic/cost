@@ -138,7 +138,12 @@ How tokentrail turns this into a verdict, on the first line of every report:
 - The counter belongs to a run of Claude Code, not to a file. It can start
   with usage carried in from outside the file, or restart at zero when a
   session is resumed. So what is compared is what both sides *added* between
-  two snapshots of the same run. That difference cancels both effects. Claude Code writes its counter at the end of
+  two snapshots of the same run. That difference cancels both effects.
+  When a session has a single snapshot, tokentrail checks whether the counter
+  equals exactly the last *n* calls before it. If it does, on input, cache read
+  and cache write at once, the counter covers only a final run, and that run
+  is verified to the token. On one machine, a file written by three Claude Code
+  versions had a counter equal to exactly its last 4 of 154 calls. Claude Code writes its counter at the end of
   each turn. A hidden call makes the gap jump between one or two snapshots; a
   counting error makes it grow at every one. Each disagreeing session shows
   its gap with sign, size and shape. When the counter goes *down* between two
@@ -147,9 +152,9 @@ How tokentrail turns this into a verdict, on the first line of every report:
 
 **What it does not prove.** That Claude Code's counter equals what you are
 billed: it is Claude Code's number, not Anthropic's invoice. Sub-agent output
-is under-logged, [see below](#how-sure-are-these-numbers). If your Claude Code
-version writes no counter (on one machine, versions up to 2.1.276 did not),
-the script says so, and nothing can be checked.
+is under-logged, [see below](#how-sure-are-these-numbers). If a session carries
+no counter (many on one machine did not), the script says so, and nothing can
+be checked.
 
 ## Why
 

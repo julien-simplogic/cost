@@ -33,7 +33,9 @@ def test_side_calls_counted_only_by_claude_code_are_shown_not_called_a_bug(env, 
     out = capsys.readouterr().out
     banner = out.splitlines()[1]
     assert banner.startswith("Partly verified, 1 of 1 sessions carry Claude Code's counter")
-    assert "a single snapshot that disagrees in 1, which can't be checked" in banner  # one cost-state only
+    # every call line matches; Haiku is only in the counter: calls no line records, not a restart
+    assert "every call line exact in 1, the counter also holding calls no line records" in banner
+    assert "restarted" not in banner
     assert "The totals below are a MINIMUM" in banner
     assert "one side only (not compared): claude-haiku-4-5-20251001" in banner
     assert "MISMATCH" not in out
@@ -232,7 +234,8 @@ def test_a_counter_that_goes_down_is_reported_as_a_restart(env, capsys):
     s.write()
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert "counter restarted in 1, nothing comparable" in out.splitlines()[1]
+    # the second counter equals exactly the call of the resumed run: restart proven
+    assert "exact on the last run in 1" in out.splitlines()[1]
     assert "counter went DOWN 1 time(s): Claude Code restarted counting" in out
     assert main(["diagnose", s.session_id[:8]]) == 0
     d = capsys.readouterr().out
@@ -301,3 +304,23 @@ def test_diagnose_says_when_no_final_run_matches(env, capsys):
     s.write()
     main(["diagnose", s.session_id[:8]])
     assert "no run of final calls adds up exactly to the last counter" in capsys.readouterr().out
+
+
+def test_a_restarted_run_that_matches_exactly_counts_as_exact_on_that_run(env, capsys):
+    s = FakeSession(env.projects)
+    s.prompt("first run")
+    s.call(new=2, write=40_000)
+    s.call(new=2, read=40_000, write=3_000)
+    s.prompt("resumed")
+    s.call(new=3, read=43_000, write=7_000)
+    s.cost_state({"claude-opus-5-5": {"inputTokens": 3, "cacheReadInputTokens": 43_000,
+                                      "cacheCreationInputTokens": 7_000, "outputTokens": 100}})
+    s.write()
+    main(["report", "--since", "all"])
+    out = capsys.readouterr().out
+    assert "exact on the last run in 1" in out.splitlines()[1]
+    assert "a single snapshot that disagrees" not in out.splitlines()[1]
+    assert "the counter equals EXACTLY the last 1 of 3 calls" in out
+    main(["check"])
+    row = [l for l in capsys.readouterr().out.splitlines() if l.startswith("2.1.288")][-1].split()
+    assert row[:4] == ["2.1.288", "1", "0", "1"]  # sessions, exact, exact on last run

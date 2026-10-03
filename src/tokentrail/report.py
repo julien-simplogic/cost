@@ -183,6 +183,7 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         mismatched.append({
             "status": status,
             "increments": inc,
+            "last_calls": cov.get("counter_equals_last_calls"),
             "session": names.session(cs[0]["session_id"]), "project": names.project(cs[0]["project"] or "?"),
             "version": cs[0]["version"],
             "input_gap": ours - src,  # signed: positive = we count more than the counter
@@ -209,6 +210,8 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         "sessions_over": n("over"),
         "sessions_spread": n("spread"),
         "sessions_increments_ok": n("increments_ok"),
+        "sessions_run_exact": n("run_exact"),
+        "sessions_lines_exact": n("lines_exact"),
         "sessions_single": n("single"),
         "sessions_restart": n("restart"),
         "sessions_under": len(mismatched),
@@ -233,6 +236,14 @@ def session_status(cov: dict) -> tuple[str, dict, dict]:
     series = cov.get("gap_series") or []
     inc = increments(series)
     shape = gap_shape(series)
+    last = cov.get("counter_equals_last_calls")
+    if last:
+        # the last counter equals, to the token on three fields, the last n calls
+        if last["calls"] == last["of"]:
+            # every call line: no restart; the rest of the counter is calls no line records
+            return "lines_exact", inc, shape
+        # only a final run: the counter restarted, and on that run we count exactly like it
+        return "run_exact", inc, shape
     if inc["pairs"]:
         if inc["ours"] > inc["counter"]:
             return "over", inc, shape  # more than Claude Code within one run: unexplained
@@ -421,8 +432,14 @@ def verification_banner(ck: dict[str, Any]) -> str:
     names = (" Models seen on one side only (not compared): " + ", ".join(one_sided) + ".") if one_sided else ""
     inc_ok, single, restart = (ck.get("sessions_increments_ok", 0), ck.get("sessions_single", 0),
                                ck.get("sessions_restart", 0))
-    if inc_ok or single or restart:
+    run_exact, lines_exact = ck.get("sessions_run_exact", 0), ck.get("sessions_lines_exact", 0)
+    if inc_ok or single or restart or run_exact or lines_exact:
         parts = [f"exact in {ok}"]
+        if lines_exact:
+            parts.append(f"every call line exact in {lines_exact}, the counter also holding calls no line records")
+        if run_exact:
+            parts.append(f"exact on the last run in {run_exact} (the counter restarted; its value equals the "
+                         "last calls to the token)")
         if inc_ok:
             parts.append(f"consistent snapshot to snapshot in {inc_ok} (the counter started above or below "
                          "this file: usage carried in, or a resumed run)")
@@ -502,6 +519,13 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
                 pct = _fmt_pct(m["input_gap_pct"])
                 extra = []
                 inc, sh = m["increments"], m["shape"]
+                if m["status"] == "lines_exact":
+                    extra.append("every call line matches the counter to the token; the counter's surplus is "
+                                 "calls no line records")
+                if m["status"] == "run_exact":
+                    lc = m["last_calls"]
+                    extra.append(f"the counter equals EXACTLY the last {lc['calls']} of {lc['of']} calls: it covers "
+                                 "only a final run, counted exactly alike")
                 if inc["pairs"]:
                     d = inc["ours"] - inc["counter"]
                     pct = _fmt_pct(100 * d / inc["counter"]) if inc["counter"] else "n/a"
@@ -618,13 +642,14 @@ def render_check(chk: dict[str, Any]) -> str:
     out.append("")
     out.append("Sessions that ran on a single version, with a counter (does the counter read the same everywhere?)")
     rows = [
-        [v, str(d.get("sessions", 0)), str(d.get("exact", 0)), str(d.get("increments_ok", 0)),
-         str(d.get("single", 0) + d.get("restart", 0)), str(d.get("over", 0) + d.get("spread", 0))]
+        [v, str(d.get("sessions", 0)), str(d.get("exact", 0) + d.get("lines_exact", 0)), str(d.get("run_exact", 0)),
+         str(d.get("increments_ok", 0)), str(d.get("single", 0) + d.get("restart", 0)),
+         str(d.get("over", 0) + d.get("spread", 0))]
         for v, d in chk.get("single_version", {}).items()
     ]
     if rows:
-        out += _table(["version", "sessions", "exact", "consistent between snapshots", "can't check",
-                       "unexplained"], rows, {1, 2, 3, 4, 5})
+        out += _table(["version", "sessions", "exact (lines)", "exact on last run", "consistent between snapshots",
+                       "can't check", "unexplained"], rows, {1, 2, 3, 4, 5, 6})
     else:
         out.append("  none: every session with a counter mixes several Claude Code versions")
     out.append("")
