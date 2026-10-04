@@ -206,11 +206,12 @@ def hook_message(est: dict[str, Any]) -> str:
             f"all {p['samples']} past tasks")
         t, c = p["turns"], p.get("cost")
         if t["spread"]:
-            lines.append(f"  turns too spread to estimate ({basis}): p10 {t['p10']:.0f}, p90 {t['p90']:.0f}")
+            lines.append(f"  turns too spread to estimate ({basis}): p{t['q'][0]:g} {t['lo']:.0f}, "
+                         f"p{t['q'][1]:g} {t['hi']:.0f}")
         else:
-            line = f"  unvalidated estimate: {t['p10']:.0f}-{t['p90']:.0f} turns, median {t['p50']:.0f} ({basis})"
+            line = f"  unvalidated estimate: {t['lo']:.0f}-{t['hi']:.0f} turns, median {t['p50']:.0f} ({basis})"
             if c:
-                line += (f" x context = {fmt_cost(c['p10'])}-{fmt_cost(c['p90'])}, "
+                line += (f" x context = {fmt_cost(c['lo'])}-{fmt_cost(c['hi'])}, "
                          "output and sub-agents not included")
             lines.append(line)
     lines += [f"  ! {w}" for w in est["warnings"]]

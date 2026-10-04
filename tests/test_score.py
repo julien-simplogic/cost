@@ -215,3 +215,10 @@ def test_after_an_expiry_what_survives_is_measured_and_tied_to_other_sessions(en
         session=a.session_id[:8], now=a.now + timedelta(hours=3)))
     assert est["certain"][0].startswith("Idle for 3.0 h")
     assert "a median 8,000 tokens were still read from cache anyway" in est["certain"][1]
+
+
+def test_estimates_recorded_with_p10_p90_keys_are_still_scored(env, store):
+    from tokentrail.analysis import bounds
+
+    assert bounds({"p10": 2, "p50": 5, "p90": 30}) == (2, 30)
+    assert bounds({"lo": 3, "p50": 5, "hi": 25, "q": [12.5, 87.5]}) == (3, 25)

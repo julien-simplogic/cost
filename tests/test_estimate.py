@@ -71,16 +71,18 @@ def test_floor_is_exact(env, store):
     assert est["frame"]["floor"]["cost"] == pytest.approx((60_000 * 0.20 + 800 * 4 * 1.25) / 1e6)
 
 
-def test_prediction_is_p10_p90_of_the_family_never_a_mean(env, store):
+def test_prediction_is_the_calibrated_interval_of_the_family_never_a_mean(env, store):
     _history(env.projects)
     s = _current(env.projects)
     p = _est(store, s, family="refactor")["predicted"]
     assert p["samples"] == 10 and p["family_source"] == "declared"
     t = p["turns"]
-    assert (t["p10"], t["p50"], t["p90"]) == pytest.approx(
-        (percentile(HISTORY_TURNS, 10), percentile(HISTORY_TURNS, 50), percentile(HISTORY_TURNS, 90)))
+    # p12.5-p87.5: the pair that held 80% on real history (p10-p90 held 89%)
+    assert t["q"] == [12.5, 87.5]
+    assert (t["lo"], t["p50"], t["hi"]) == pytest.approx(
+        (percentile(HISTORY_TURNS, 12.5), percentile(HISTORY_TURNS, 50), percentile(HISTORY_TURNS, 87.5)))
     mean = sum(HISTORY_TURNS) / len(HISTORY_TURNS)
-    assert mean not in (t["p10"], t["p50"], t["p90"])
+    assert mean not in (t["lo"], t["p50"], t["hi"])
     assert p["validated"] is False
 
 
@@ -91,7 +93,7 @@ def test_cost_is_turns_times_context(env, store):
     t, c, i = est["predicted"]["turns"], est["predicted"]["cost"], est["computed"]["input_next"]
     floor = est["frame"]["floor"]["cost"]
     # opus 5.5 cache read $0.20/MTok: every further turn re-reads the next call's context
-    assert c["p90"] == pytest.approx(floor + (t["p90"] - 1) * i * 0.20 / 1e6)
+    assert c["hi"] == pytest.approx(floor + (t["hi"] - 1) * i * 0.20 / 1e6)
 
 
 def test_spread_history_gives_no_interval(env, store):

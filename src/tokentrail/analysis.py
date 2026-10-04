@@ -15,7 +15,12 @@ TTL_SECONDS = {"5m": 300, "1h": 3600}
 MIN_CACHEABLE = 4096  # below this a missing cache read is not worth flagging
 # Files Claude Code puts in, or builds, the start of the prompt.
 PREFIX_FILES = {"CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "settings.json", "settings.local.json"}
-SPREAD_LIMIT = 100  # p90 / p10 at or above this (two orders of magnitude): no interval is given
+SPREAD_LIMIT = 100  # high / low bound at or above this (two orders of magnitude): no interval is given
+# The interval aimed at holding 80% of outcomes. p10-p90 held 89% on real history (turns are
+# whole numbers with many ties); p12.5-p87.5, chosen on the older half of that history, is the
+# pair closest to 80% (scripts/study.py 3). `score` keeps checking it.
+INTERVAL = (12.5, 87.5)
+INTERVAL_LABEL = f"p{INTERVAL[0]:g}-p{INTERVAL[1]:g}"
 
 
 def parse_ts(s: Optional[str]) -> Optional[datetime]:
@@ -305,15 +310,20 @@ def percentile_sorted(xs: Sequence[float], q: float) -> Optional[float]:
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
-def distribution(values: Sequence[float]) -> Optional[dict]:
-    """p10, median, p90, and whether the spread is too wide to give an interval."""
+def distribution(values: Sequence[float], q: tuple[float, float] = INTERVAL) -> Optional[dict]:
+    """Low bound, median, high bound (percentiles q), and whether the spread is too wide to give an interval."""
     if not values:
         return None
     xs = sorted(values)
-    p10, p50, p90 = (percentile_sorted(xs, q) for q in (10, 50, 90))
-    ratio = p90 / p10 if p10 else float("inf")  # type: ignore[operator]
-    return {"n": len(xs), "p10": p10, "p50": p50, "p90": p90, "ratio": ratio,
+    lo, p50, hi = (percentile_sorted(xs, x) for x in (q[0], 50, q[1]))
+    ratio = hi / lo if lo else float("inf")  # type: ignore[operator]
+    return {"n": len(xs), "lo": lo, "p50": p50, "hi": hi, "q": list(q), "ratio": ratio,
             "spread": ratio >= SPREAD_LIMIT}
+
+
+def bounds(d: dict) -> tuple[float, float]:
+    """(low, high) of an interval dict; estimates recorded before p12.5-p87.5 used p10/p90 keys."""
+    return (d["lo"], d["hi"]) if "lo" in d else (d["p10"], d["p90"])
 
 
 @dataclass

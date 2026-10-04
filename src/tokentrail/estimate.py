@@ -197,7 +197,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
 
         def cost_at(n: float) -> float:
             return floor_cost + max(n - 1, 0) * reread  # type: ignore[operator]
-        cost = {"p10": cost_at(turns["p10"]), "p50": cost_at(turns["p50"]), "p90": cost_at(turns["p90"])}
+        cost = {"lo": cost_at(turns["lo"]), "p50": cost_at(turns["p50"]), "hi": cost_at(turns["hi"])}
 
     # -------------------------------------------------------------- ceiling
     max_tokens = (
@@ -243,7 +243,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         warnings.append(
             f"Large context ({fmt_tokens(input_next)}): every further turn re-reads it "
             f"(~{fmt_cost(per_turn)} per turn from cache"
-            + (f", {int(turns['p90'])} turns at p90" if turns else "")
+            + (f", {int(turns['hi'])} turns at p{turns['q'][1]:g}" if turns else "")
             + "). /compact or a fresh session resets it."
         )
     sub_share = _share([t.sub_tokens for t in fam_hist], [t.tokens for t in fam_hist])
@@ -485,12 +485,14 @@ def turns_lines(p: dict[str, Any]) -> list[str]:
     if not t:
         return [f"no past task to compare with yet ({p['samples']} found); the floor and ceiling below hold."]
     if t["spread"]:
-        return [f"turns too spread to estimate: p10 {_n(t['p10'])}, median {_n(t['p50'])}, p90 {_n(t['p90'])} "
+        return [f"turns too spread to estimate: p{t['q'][0]:g} {_n(t['lo'])}, median {_n(t['p50'])}, "
+                f"p{t['q'][1]:g} {_n(t['hi'])} "
                 f"(x{t['ratio']:.0f}, two orders of magnitude or more); no interval given"]
-    out = [f"model calls (main thread)  {_n(t['p10'])} - {_n(t['p90'])}, median {_n(t['p50'])}"]
+    out = [f"model calls (main thread)  {_n(t['lo'])} - {_n(t['hi'])}, median {_n(t['p50'])}   "
+           f"(p{t['q'][0]:g}-p{t['q'][1]:g}, aimed at 80%)"]
     if p.get("cost"):
         c = p["cost"]
-        out.append(f"cost of those turns        {fmt_cost(c['p10'])} - {fmt_cost(c['p90'])}, median {fmt_cost(c['p50'])}"
+        out.append(f"cost of those turns        {fmt_cost(c['lo'])} - {fmt_cost(c['hi'])}, median {fmt_cost(c['p50'])}"
                    "   (turns x context; output and sub-agents not included)")
     return out
 

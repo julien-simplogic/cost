@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .analysis import (
-    SPREAD_LIMIT, expiries, other_session_active, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
+    INTERVAL, INTERVAL_LABEL, SPREAD_LIMIT, bounds, expiries, other_session_active, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
     percentile_sorted,
 )
 from . import metrics
@@ -176,14 +176,14 @@ def _score(scored: list[dict]) -> dict[str, Any]:
         return lo <= x <= hi
 
     turns_in = sum(1 for p in with_interval if inside(
-        p["prediction"]["turns"]["p10"], p["outcome"]["turns_main"], p["prediction"]["turns"]["p90"]))
+        bounds(p["prediction"]["turns"])[0], p["outcome"]["turns_main"], bounds(p["prediction"]["turns"])[1]))
     has_turns = with_interval + no_interval
     turn_err = [abs(p["outcome"]["turns_main"] - p["prediction"]["turns"]["p50"]) for p in has_turns]
     turn_ratio = [p["outcome"]["turns_main"] / p["prediction"]["turns"]["p50"]
                   for p in has_turns if p["prediction"]["turns"]["p50"]]
     priced = [p for p in with_interval if p["prediction"].get("cost") and not p["outcome"]["unpriced_calls"]]
     cost_in = sum(1 for p in priced if inside(
-        p["prediction"]["cost"]["p10"], p["outcome"]["cost"], p["prediction"]["cost"]["p90"]))
+        bounds(p["prediction"]["cost"])[0], p["outcome"]["cost"], bounds(p["prediction"]["cost"])[1]))
     cost_ratio = [p["outcome"]["cost"] / p["prediction"]["cost"]["p50"]
                   for p in priced if p["prediction"]["cost"]["p50"]]
     inp_err = [(p["outcome"]["first_input"] - p["prediction"]["input_next"]) / p["outcome"]["first_input"]
@@ -191,10 +191,10 @@ def _score(scored: list[dict]) -> dict[str, Any]:
     cache_ok = sum(1 for p in scored if _cache_as_said(
         p["prediction"]["cached"], p["outcome"]["first_cache_read"], p["outcome"]["first_input"]))
     fam = [p for p in scored if p["prediction"]["family_source"] != "declared"]
-    turn_items = [(p["session_key"], p["prediction"]["turns"]["p10"], p["outcome"]["turns_main"],
-                   p["prediction"]["turns"]["p90"], p["prediction"]["turns"]["p50"]) for p in with_interval]
-    cost_items = [(p["session_key"], p["prediction"]["cost"]["p10"], p["outcome"]["cost"],
-                   p["prediction"]["cost"]["p90"], p["prediction"]["cost"]["p50"]) for p in priced]
+    turn_items = [(p["session_key"], bounds(p["prediction"]["turns"])[0], p["outcome"]["turns_main"],
+                   bounds(p["prediction"]["turns"])[1], p["prediction"]["turns"]["p50"]) for p in with_interval]
+    cost_items = [(p["session_key"], bounds(p["prediction"]["cost"])[0], p["outcome"]["cost"],
+                   bounds(p["prediction"]["cost"])[1], p["prediction"]["cost"]["p50"]) for p in priced]
     return {
         "n": n,
         "turns_metrics": metrics.summarize(turn_items, bootstrap=BOOTSTRAP) if turn_items else None,
@@ -318,7 +318,7 @@ def _expiry_stats(rows) -> dict[str, Any]:
 
 
 def backtest_turns(task_stats: list[TaskStats]) -> dict[str, Any]:
-    """Each task's turns against the p10-p90 the tasks before it would have given.
+    """Each task's turns against the interval (INTERVAL) the tasks before it would have given.
 
     Two bases. "all": every earlier task; nothing about the task itself is used.
     "family": earlier tasks of its family, as estimate does; but here the family
@@ -333,7 +333,7 @@ def backtest_turns(task_stats: list[TaskStats]) -> dict[str, Any]:
         for b, basis in (("all", seen_all), ("family", seen_fam.get(t.family or "?", []))):
             if len(basis) < MIN_BASIS:
                 continue
-            p10, p50, p90 = (percentile_sorted(basis, q) for q in (10, 50, 90))
+            p10, p50, p90 = (percentile_sorted(basis, q) for q in (INTERVAL[0], 50, INTERVAL[1]))
             r = res[b]
             if p10 and p90 / p10 >= SPREAD_LIMIT:  # type: ignore[operator]
                 r["spread"] += 1
@@ -389,15 +389,16 @@ def render_turns(rep: dict[str, Any]) -> str:
         if not m:
             rows.append([fam, "0", "", "", "", "", "", "no tasks"])
             continue
-        rows.append([fam, f"{d['tasks']:,}", _n(m["p10"]), _n(m["p50"]), _n(m["p90"]),
+        rows.append([fam, f"{d['tasks']:,}", _n(m["lo"]), _n(m["p50"]), _n(m["hi"]),
                      "x" + (f"{m['ratio']:.0f}" if m["ratio"] != float("inf") else "?"),
-                     f"{_n(a['p50'])} / {_n(a['p90'])}", verdict(m)])
-    out += _table(["family", "tasks", "p10", "median", "p90", "p90/p10", "all calls p50/p90", ""],
+                     f"{_n(a['p50'])} / {_n(a['hi'])}", verdict(m)])
+    lo_l, hi_l = (f"p{x:g}" for x in INTERVAL)
+    out += _table(["family", "tasks", lo_l, "median", hi_l, f"{hi_l}/{lo_l}", f"all calls p50/{hi_l}", ""],
                   rows, {1, 2, 3, 4, 5, 6})
     out.append("")
-    out.append("  p10 / median / p90: main-thread model calls per task, the ones that each re-read the whole")
+    out.append(f"  {INTERVAL_LABEL.replace('-', ' / median / ')}: main-thread model calls per task, the ones that each re-read the whole")
     out.append("  context, so the cost of a task is roughly turns x context size. All calls adds sub-agents.")
-    out.append(f"  A family whose p90 is {rep['spread_limit']}x its p10 or more (two orders of magnitude) gets no")
+    out.append(f"  A family whose high bound is {rep['spread_limit']}x its low one or more (two orders of magnitude) gets no")
     out.append("  interval from `estimate`: one that wide would cover everything and say nothing.")
     declared = sum(d["declared"] for f, d in rep["families"].items() if f != "all")
     total = rep["families"]["all"]["tasks"]
@@ -422,7 +423,7 @@ def render_score(rep: dict[str, Any]) -> str:
     else:
         out.append(f"Last {s['n']} scored estimates")
         n_i = s["with_interval"]
-        out.append(f"  turns inside p10-p90          {_of(s['turns_inside'], n_i)}   (a calibrated 10-90 interval holds ~80%)")
+        out.append(f"  turns inside the interval     {_of(s['turns_inside'], n_i)}   (it aims at 80%)")
         out.append(f"  turns, median error           {_num(s['turns_median_abs_error'])} turns; "
                    f"median actual / predicted median x{_num(s['turns_median_actual_over_p50'], 2)}")
         out.append(f"  cost inside its band          {_of(s['cost_inside'], s['cost_scored'])}   "
@@ -479,7 +480,7 @@ def render_score(rep: dict[str, Any]) -> str:
     for b, label in (("all", "basis: all earlier tasks"),
                      ("family", "basis: earlier tasks of its family (optimistic: family guessed from its own tools)")):
         d = t[b]
-        line = (f"  {label}: {_of(d['inside'], d['n'])} inside p10-p90, median error "
+        line = (f"  {label}: {_of(d['inside'], d['n'])} inside {INTERVAL_LABEL}, median error "
                 f"{_num(d['median_abs_error'])} turns")
         if d["spread"]:
             line += f"; {d['spread']} without an interval (too spread)"

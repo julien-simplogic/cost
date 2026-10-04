@@ -267,8 +267,8 @@ Computed (from the session's last real call)
   (text -> tokens at 2.5 chars/token, default, too little history to calibrate; no network tokenizer)
 
 Unvalidated estimate: turns from 15 past 'refactor' tasks (family 'refactor', declared)
-  model calls (main thread)  8 - 26, median 17
-  cost of those turns        $0.159 - $0.479, median $0.317
+  model calls (main thread)  9 - 25, median 17   (p12.5-p87.5, aimed at 80%)
+  cost of those turns        $0.165 - $0.459, median $0.317
                              (turns x context; output and sub-agents not included)
   Not yet compared with outcomes: `tokentrail score` says how past estimates fared.
 
@@ -312,9 +312,10 @@ Three kinds of numbers, never mixed:
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
-  the 10th, 50th and 90th percentiles of main-thread turns over your past
-  tasks of the same family, never a mean, and multiplies by the context size.
-  When a family's turns spread over two orders of magnitude (p90 ≥ 100 × p10),
+  the 12.5th, 50th and 87.5th percentiles of main-thread turns over your past
+  tasks, never a mean, and multiplies by the context size. That pair, not
+  p10-p90, is the one that held about 80% of outcomes in a backtest (below).
+  When turns spread over two orders of magnitude (high bound ≥ 100 × low),
   it says so and gives no interval: one that wide covers everything and says
   nothing. **This part has not been checked against outcomes yet**, which is
   why it is called an estimate, not a prediction. Every estimate is recorded
@@ -348,10 +349,10 @@ family you declare (`--family`, or `tokentrail tag <task> <family>`) is used.
 3,916 finished tasks; every backtest estimates each task from earlier tasks
 only, with 95% intervals from resampling sessions):
 
-- *The p10-p90 interval is too wide:* it holds 89% of outcomes, not 80%.
-  p12.5-p87.5, chosen on the older half, narrows it from 29 to 25 turns on the
-  newer half, but holds 89% there too and leaves the interval score unchanged
-  (57.2 against 57.4).
+- *p10-p90 was too wide:* it held 89% of outcomes, not 80%. p12.5-p87.5,
+  chosen on the older half, narrows it from 29 to 25 turns on the newer half
+  with the same interval score (57.2 against 57.4), so `estimate` now uses
+  it. On that newer half it still held 89%: `score` keeps watching.
 - *The longer a task has run, the longer it still runs.* Median turns still
   ahead: 4 after 1 turn, 5 after 3, 7 after 5, 11 after 10 (p90 55).
 - *The first task of a session is the long one:* median 22 turns, p90 108
@@ -395,17 +396,17 @@ $ tokentrail turns
 
 tokentrail turns: how many model calls a task takes, by family
 
-family    tasks  p10  median  p90  p90/p10  all calls p50/p90
---------  -----  ---  ------  ---  -------  -----------------  --------------------------
-question      6    1       1    1       x1              1 / 1  too few (estimate needs 8)
-refactor     16    8      18   26       x3            23 / 32  tight
-review        7    7       8   12       x2            17 / 22  too few (estimate needs 8)
-measure      11    2       2    2       x1              2 / 2  tight
-all          40    1       8   23      x23            14 / 26  wide
+family    tasks  p12.5  median  p87.5  p87.5/p12.5  all calls p50/p87.5
+--------  -----  -----  ------  -----  -----------  -------------------  --------------------------
+question      6      1       1      1           x1                1 / 1  too few (estimate needs 8)
+refactor     16      9      18     26           x3              23 / 31  tight
+review        7      7       8     12           x2              17 / 22  too few (estimate needs 8)
+measure      11      2       2      2           x1                2 / 2  tight
+all          40      1       8     20          x20              14 / 25  wide
 
-  p10 / median / p90: main-thread model calls per task, the ones that each re-read the whole
+  p12.5 / median / p87.5: main-thread model calls per task, the ones that each re-read the whole
   context, so the cost of a task is roughly turns x context size. All calls adds sub-agents.
-  A family whose p90 is 100x its p10 or more (two orders of magnitude) gets no
+  A family whose high bound is 100x its low one or more (two orders of magnitude) gets no
   interval from `estimate`: one that wide would cover everything and say nothing.
   Families: 0 of 40 declared with `tokentrail tag`, the rest guessed from each
   task's first tool calls. `estimate` guesses from your text instead; `score` says how often
@@ -414,7 +415,7 @@ all          40    1       8   23      x23            14 / 26  wide
 
 (Invented demo data, as everywhere in this README.) Main-thread turns are the
 calls that each re-read the whole context, so the cost of a task is roughly
-turns × context size. Read the p90/p10 column before trusting any interval.
+turns × context size. Read the ratio column before trusting any interval.
 Families here are guessed from each task's tool calls, which `estimate`
 cannot know before you send; see above why it does not use them.
 
@@ -430,8 +431,8 @@ estimate and kept, even after Claude Code deletes old transcripts.
 `tokentrail score` then reports, over the last N scored estimates (`--last`,
 default 50):
 
-- how many outcomes fell inside the p10-p90 turn interval (a calibrated
-  interval holds about 80%), and the median error in turns;
+- how many outcomes fell inside the turn interval (it aims at 80%), and the
+  median error in turns;
 - the same for the cost band, with the median ratio actual / estimated (the
   band leaves out output and sub-agents, so expect it to run low);
 - the computed part: next-call input error, and whether the cache was warm or
