@@ -189,6 +189,7 @@ def test_cli_score_runs_and_estimate_records(env, capsys):
     assert "Recorded estimates: 1 (cli 1)" in out
     assert "No estimate scored yet" in out
     assert "Backtest on your history" in out
+    assert "interval score (Winkler" in out and "vs nominal 80%" in out and "log(estimate/actual)" in out
 
 
 def test_after_an_expiry_what_survives_is_measured_and_tied_to_other_sessions(env, store):

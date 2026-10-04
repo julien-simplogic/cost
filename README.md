@@ -415,6 +415,14 @@ default 50):
 - how often the family guessed from your text matched the one guessed later
   from the task's tool calls.
 
+Each interval is also judged by measures that cannot be gamed by widening it:
+coverage against the nominal 80%, the interval score (Winkler: width plus a
+penalty of 10 per unit by which the outcome falls outside; lower is better),
+the median absolute error, and the median log(estimate / actual), which
+treats twice too high and half too low alike. Each comes with a 95% interval
+from resampling whole sessions, not tasks, because tasks of one session are
+alike and resampling tasks would claim more certainty than the data holds.
+
 It also backtests on your whole history what needs no recorded estimate: the
 computed next-call input and cache state before each of your prompts, and the
 turn interval each task would have got from the tasks before it. The

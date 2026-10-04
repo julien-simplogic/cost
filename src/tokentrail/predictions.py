@@ -18,6 +18,7 @@ Only numbers are stored, never the prompt text.
 from __future__ import annotations
 
 import bisect
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -25,6 +26,7 @@ from .analysis import (
     SPREAD_LIMIT, expiries, other_session_active, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
     percentile_sorted,
 )
+from . import metrics
 from .classify import FAMILIES
 from .prices import PriceTable
 from .report import _table
@@ -34,6 +36,7 @@ LINK_WINDOW_S = 1800  # an estimate older than this when its session's next task
 FINISHED_AFTER_S = 3600  # a task with no activity for this long is over
 START_SLACK_S = 5  # the hook runs just before the prompt is written: allow a little clock jitter
 MIN_BASIS = 8  # same as estimate.MIN_FAMILY_SAMPLES
+BOOTSTRAP = 400  # session resamples per confidence interval: ~1 s on 4,000 tasks
 
 
 def record(store: Store, est: dict[str, Any], origin: str) -> int:
@@ -188,8 +191,14 @@ def _score(scored: list[dict]) -> dict[str, Any]:
     cache_ok = sum(1 for p in scored if _cache_as_said(
         p["prediction"]["cached"], p["outcome"]["first_cache_read"], p["outcome"]["first_input"]))
     fam = [p for p in scored if p["prediction"]["family_source"] != "declared"]
+    turn_items = [(p["session_key"], p["prediction"]["turns"]["p10"], p["outcome"]["turns_main"],
+                   p["prediction"]["turns"]["p90"], p["prediction"]["turns"]["p50"]) for p in with_interval]
+    cost_items = [(p["session_key"], p["prediction"]["cost"]["p10"], p["outcome"]["cost"],
+                   p["prediction"]["cost"]["p90"], p["prediction"]["cost"]["p50"]) for p in priced]
     return {
         "n": n,
+        "turns_metrics": metrics.summarize(turn_items, bootstrap=BOOTSTRAP) if turn_items else None,
+        "cost_metrics": metrics.summarize(cost_items, bootstrap=BOOTSTRAP) if cost_items else None,
         "with_interval": len(with_interval),
         "no_interval_spread": len(no_interval),
         "no_history": no_history,
@@ -319,7 +328,7 @@ def backtest_turns(task_stats: list[TaskStats]) -> dict[str, Any]:
     ts = sorted((t for t in task_stats if t.tracked and t.turns_main and t.first_input), key=lambda t: t.started)
     seen_all: list[int] = []
     seen_fam: dict[str, list[int]] = {}
-    res = {b: {"n": 0, "inside": 0, "spread": 0, "abs_err": []} for b in ("all", "family")}
+    res = {b: {"n": 0, "inside": 0, "spread": 0, "items": []} for b in ("all", "family")}
     for t in ts:
         for b, basis in (("all", seen_all), ("family", seen_fam.get(t.family or "?", []))):
             if len(basis) < MIN_BASIS:
@@ -331,11 +340,13 @@ def backtest_turns(task_stats: list[TaskStats]) -> dict[str, Any]:
                 continue
             r["n"] += 1
             r["inside"] += int(p10 <= t.turns_main <= p90)  # type: ignore[operator]
-            r["abs_err"].append(abs(t.turns_main - p50))  # type: ignore[operator]
+            r["items"].append((t.session_key, p10, t.turns_main, p90, p50))
         bisect.insort(seen_all, t.turns_main)
         bisect.insort(seen_fam.setdefault(t.family or "?", []), t.turns_main)
     for r in res.values():
-        r["median_abs_error"] = percentile(r.pop("abs_err"), 50)
+        items = r.pop("items")
+        r["metrics"] = metrics.summarize(items, bootstrap=BOOTSTRAP) if items else None
+        r["median_abs_error"] = r["metrics"]["abs_error"] if items else None
     return res
 
 
@@ -417,6 +428,11 @@ def render_score(rep: dict[str, Any]) -> str:
         out.append(f"  cost inside its band          {_of(s['cost_inside'], s['cost_scored'])}   "
                    f"median actual / predicted x{_num(s['cost_median_actual_over_p50'], 2)} "
                    "(the band leaves out output and sub-agents)")
+        if s.get("turns_metrics"):
+            out += metric_lines(s["turns_metrics"], "turns", "    ")
+        if s.get("cost_metrics"):
+            out.append("  cost band, same measures:")
+            out += metric_lines(s["cost_metrics"], "$", "    ")
         if s["no_interval_spread"]:
             out.append(f"  no interval given (spread)    {s['no_interval_spread']}")
         if s["no_history"]:
@@ -468,7 +484,37 @@ def render_score(rep: dict[str, Any]) -> str:
         if d["spread"]:
             line += f"; {d['spread']} without an interval (too spread)"
         out.append(line)
+        if d.get("metrics"):
+            out += metric_lines(d["metrics"], "turns", "    ")
+    out.append("  (95% intervals in brackets: sessions resampled, not tasks, since tasks of one session are alike)")
     return "\n".join(out)
+
+
+def metric_lines(m: dict, unit: str, indent: str) -> list[str]:
+    """Coverage against nominal, interval score, errors, each with its session-bootstrap 95% interval."""
+    def ci(key: str, fmt) -> str:
+        c = m.get(key + "_ci")
+        return f" [{fmt(c[0])}, {fmt(c[1])}]" if c else ""
+
+    def pct(x):
+        return "?" if x is None else f"{100 * x:.0f}%"
+
+    def num(x):
+        return "?" if x is None else (f"{x:.2f}" if unit == "$" and abs(x) < 10 else f"{x:.1f}")
+
+    def lg(x):
+        return "?" if x is None else f"{x:+.2f}"
+
+    le = m.get("log_error")
+    ratio = f" (median estimate x{math.exp(le):.2f} the actual)" if le is not None else ""
+    return [
+        f"{indent}coverage {pct(m['coverage'])}{ci('coverage', pct)} vs nominal {pct(m['nominal'])}; "
+        f"{m['n']} tasks in {m['sessions']} sessions",
+        f"{indent}interval score (Winkler, lower is better) {num(m['interval_score'])}{ci('interval_score', num)}; "
+        f"median width {num(m['width'])} {unit}",
+        f"{indent}median error {num(m['abs_error'])}{ci('abs_error', num)} {unit}; "
+        f"median log(estimate/actual) {lg(le)}{ci('log_error', lg)}{ratio}",
+    ]
 
 
 def _fmt_counts(d: dict) -> str:
