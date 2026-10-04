@@ -107,3 +107,13 @@ def test_step4_remaining_turns(study, capsys):
     [line] = [ln for ln in out.splitlines() if ln.startswith("ahead after k=3")]
     assert f"n={len(long3):>5}" in line
     assert "leak-free backtest" in out and "k=0" in out
+
+
+def test_step5_compares_cost_methods_on_the_same_tasks(study, capsys):
+    tasks = study.load()
+    assert all(t.floor > 0 for t in tasks)
+    study.step5(tasks)
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if "coverage" in ln and "sessions" in ln]
+    assert len(lines) == 4
+    assert len({ln.split("n=")[1].split("(")[0] for ln in lines}) == 1  # same n for every method

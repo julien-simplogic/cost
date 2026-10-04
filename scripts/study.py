@@ -8,6 +8,7 @@ Steps (numbering of the 4 Oct 2026 plan):
   1  task definition: short follow-ups merged into the previous task
   3  recalibration: which quantiles give 80% in a leak-free backtest
   4  turns still ahead once a task has made k turns
+  5  cost rather than turns: context growth per turn, and which cost estimate does best
 """
 
 from __future__ import annotations
@@ -128,6 +129,8 @@ class T:
     calls: int  # all calls, sub-agents included
     cost: float
     first_input: int
+    floor: float  # input cost of the task's first call: the computed part, known before sending
+    reread: float  # cost of re-reading the first call's context once from cache
     model: str
     project: str
     family: Optional[str]
@@ -143,13 +146,24 @@ def load(with_prompts: bool = True) -> list[T]:
     meta = load_tasks_meta(con)
     rows = enrich(con.execute("SELECT * FROM records ORDER BY ts, rowid").fetchall(), table, meta)
     feats = prompt_features(load_followups()) if with_prompts else {}
+    newest = parse_ts(max((r.ts for r in rows), default=""))
+    stats = [t for t in group_tasks(rows, meta) if t.tracked and t.turns_main and t.first_input]
+    last_of_session = {}
+    for t in stats:
+        if t.started >= last_of_session.get(t.session_key, ("", None))[0]:
+            last_of_session[t.session_key] = (t.started, t.task_id)
     out = []
-    for t in group_tasks(rows, meta):
-        if not t.tracked or not t.turns_main or not t.first_input:
-            continue
+    for t in stats:
+        end = parse_ts(max(r.ts for r in t.rows))
+        if last_of_session[t.session_key][1] == t.task_id and newest and end and (newest - end).total_seconds() < 3600:
+            continue  # may still be running
         main = [r for r in t.rows if r.trigger != "subagent"]
+        f = main[0]
+        p = table.lookup(f.model)
+        floor = (f.cost - f.output * p.output / 1e6) if (p and f.cost is not None) else 0.0
+        reread = f.input_total * p.cache_read / 1e6 if p else 0.0
         out.append(T(t.session_key, t.task_id, t.started, t.turns_main, t.turns, t.cost, t.first_input,
-                     main[0].model, t.project, t.family, t.family_source, feats.get(t.task_id), t.rows))
+                     floor, reread, f.model, t.project, t.family, t.family_source, feats.get(t.task_id), t.rows))
     out.sort(key=lambda t: (t.started, t.task_id))
     return out
 
@@ -183,7 +197,7 @@ def merge_followups(tasks: list[T]) -> tuple[list[T], int]:
         for t in ts:
             if cur is not None and t.prompt and t.prompt.followup:
                 cur = T(cur.key, cur.task_id, cur.started, cur.turns + t.turns, cur.calls + t.calls,
-                        cur.cost + t.cost, cur.first_input, cur.model, cur.project, cur.family,
+                        cur.cost + t.cost, cur.first_input, cur.floor, cur.reread, cur.model, cur.project, cur.family,
                         cur.family_source, cur.prompt, cur.rows + t.rows)
                 merged[-1] = cur
                 folded += 1
@@ -245,7 +259,7 @@ def score_line(label: str, items, unit: str = "turns") -> str:
         c = m[k + "_ci"]
         return f"[{f(c[0])}, {f(c[1])}]" if c else ""
     pct = lambda x: f"{100 * x:.1f}%"  # noqa: E731
-    num = lambda x: f"{x:.1f}"  # noqa: E731
+    num = (lambda x: f"${x:.3f}") if unit == "$" else (lambda x: f"{x:.1f}")  # noqa: E731
     lg = lambda x: f"{x:+.2f}"  # noqa: E731
     return (f"{label:30} n={m['n']:>5} ({m['sessions']} sessions)  coverage {pct(m['coverage'])} {ci('coverage', pct)}  "
             f"interval score {num(m['interval_score'])} {ci('interval_score', num)}  width {num(m['width'])}  "
@@ -311,7 +325,61 @@ def step4(tasks: list[T]) -> None:
     print("Log error leaves out tasks that end exactly at k (0 turns ahead).")
 
 
-STEPS = {"1": step1, "3": step3, "4": step4}
+# ------------------------------------------------------------------ step 5
+
+
+def growth(t: T) -> list[int]:
+    """Tokens added to the context between consecutive main-thread calls of a task
+    (the previous call's answer excluded): tool results, plus Claude Code's own additions."""
+    main = [r for r in t.rows if r.trigger != "subagent"]
+    return [b.input_total - a.input_total - a.output for a, b in zip(main, main[1:])
+            if not b.extra.get("after_compaction") and b.input_total >= 0.5 * a.input_total]
+
+
+def step5(tasks: list[T]) -> None:
+    print("=== Step 5: cost rather than turns")
+    g = [x for t in tasks for x in growth(t)]
+    print(dist(g, "tokens added per turn"))
+    print(f"  turns that shrank the context (compaction aside): {sum(1 for x in g if x < 0)} of {len(g)}")
+    priced = [t for t in tasks if t.floor > 0 and t.cost > 0]
+    print(dist([t.cost for t in priced], "task cost, $"))
+    print(dist([t.cost / t.floor for t in priced], "task cost / first-call input"))
+    print("\nleak-free backtest, same tasks for every method, interval p10-p90 of the task's total cost:")
+    turns_q = {t.task_id: v for t, v in leak_free(priced, lambda t: t.turns)}
+    ratio_q = {t.task_id: v for t, v in leak_free(priced, lambda t: t.cost / t.floor)}
+    abs_q = {t.task_id: v for t, v in leak_free(priced, lambda t: t.cost)}
+    grow_med: dict[str, float] = {}
+    seen: list[int] = []
+    for t in priced:  # median growth per turn from earlier tasks only
+        grow_med[t.task_id] = percentile(seen, 50) if seen else 0.0
+        seen.extend(growth(t))
+    both = [t for t in priced if t.task_id in turns_q and t.task_id in ratio_q and t.task_id in abs_q]
+
+    def via_turns(t, n, with_growth=False):
+        n = max(n, 1)
+        extra = 0.0
+        if with_growth and t.first_input:
+            # each later turn re-reads the context, grown by the median growth per turn
+            extra = t.reread / t.first_input * grow_med[t.task_id] * (n - 1) * n / 2
+        return t.floor + (n - 1) * t.reread + extra
+
+    methods = {
+        "turns x context (tool today)": lambda t: tuple(via_turns(t, n) for n in turns_q[t.task_id]),
+        "turns x growing context": lambda t: tuple(via_turns(t, n, True) for n in turns_q[t.task_id]),
+        "cost / first input, x this one": lambda t: tuple(r * t.floor for r in ratio_q[t.task_id]),
+        "task cost directly": lambda t: abs_q[t.task_id],
+    }
+    for name, f in methods.items():
+        items = []
+        for t in both:
+            lo, mid, hi = f(t)
+            items.append((t.key, lo, t.cost, hi, mid))
+        print(score_line(name, items, unit="$"))
+    print("Interval score is in dollars here; a lower one is better on the same tasks. Turns-based methods")
+    print("leave out output and sub-agents, as the tool does today.")
+
+
+STEPS = {"1": step1, "3": step3, "4": step4, "5": step5}
 
 
 def main(argv: list[str]) -> None:
