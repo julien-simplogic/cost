@@ -167,6 +167,7 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         return c[f"{side}_input"] + c[f"{side}_cache_read"] + c[f"{side}_cache_write"]
 
     one_sided: dict[str, set[str]] = {"counter": set(), "lines": set()}
+    floor: dict[str, Any] = {"sessions": 0, "lines": [0, 0, 0, 0], "gap": [0, 0, 0, 0]}
     input_ok, mismatched = [], []
     for k, cs in by_session.items():
         counter_only = sorted(c["model"] for c in cs if ic(c, "ours") == 0 and ic(c, "source"))
@@ -175,11 +176,20 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         one_sided["lines"].update(lines_only)
         if _rows_match(cs):
             input_ok.append(k)
+            fg = floor_gap("exact", cs, {})
+            floor["sessions"] += 1
+            floor["lines"] = [a + b for a, b in zip(floor["lines"], fg[0])]
+            floor["gap"] = [a + b for a, b in zip(floor["gap"], fg[1])]
             continue
         src = sum(ic(c, "source") for c in cs)
         ours = sum(ic(c, "ours") for c in cs)
         cov = json.loads(cs[0]["coverage"] or "{}")
         status, inc, shape = session_status(cov)
+        fg = floor_gap(status, cs, cov)
+        if fg:
+            floor["sessions"] += 1
+            floor["lines"] = [a + b for a, b in zip(floor["lines"], fg[0])]
+            floor["gap"] = [a + b for a, b in zip(floor["gap"], fg[1])]
         mismatched.append({
             "status": status,
             "increments": inc,
@@ -217,13 +227,42 @@ def _checks_summary(store: Store, session_keys: set[str], names: "_Anonymizer") 
         "sessions_under": len(mismatched),
         "models_counter_only": sorted(one_sided["counter"]),
         "models_lines_only": sorted(one_sided["lines"]),
-        "counter_input": sum(ic(c, "source") for c in all_c),
-        "lines_input": sum(ic(c, "ours") for c in all_c),
+        "floor": floor,
         "mismatched": mismatched,
         "source_output": sum(c["source_output"] for c in all_c),
         "ours_output_logged": sum(c["ours_output_logged"] for c in all_c),
         "ours_output": sum(c["ours_output"] for c in all_c),
     }
+
+
+def floor_gap(status: str, rows, cov: dict) -> Optional[tuple[list[int], list[int]]]:
+    """What the call lines miss, where the comparison means something.
+
+    Returns (lines, counter minus lines) per field [input, cache read, cache write,
+    output], or None. Only scopes where both sides cover the same calls count:
+    an exact session (all models), the final run a restarted counter equals, and
+    what both sides added between snapshots of one run. Absolute totals of other
+    sessions mix in usage the counter carried in, or calls it never covered.
+    """
+    keys = ("input", "cache_read", "cache_write", "output")
+    if status in ("exact", "lines_exact"):
+        ours = [sum(r[f"ours_{k}"] for r in rows) for k in keys]
+        src = [sum(r[f"source_{k}"] for r in rows) for k in keys]
+        return ours, [b - a for a, b in zip(ours, src)]
+    if status == "run_exact":
+        last = cov.get("counter_equals_last_calls") or {}
+        if "ours" in last and "counter" in last:
+            return last["ours"], [b - a for a, b in zip(last["ours"], last["counter"])]
+        return None
+    if status == "increments_ok":
+        fs = cov.get("field_series") or []
+        runs = [(a, b) for a, b in zip(fs, fs[1:]) if sum(b[2][:3]) >= sum(a[2][:3])]
+        if not runs:
+            return None
+        ours = [sum(b[1][i] - a[1][i] for a, b in runs) for i in range(4)]
+        src = [sum(b[2][i] - a[2][i] for a, b in runs) for i in range(4)]
+        return ours, [b - a for a, b in zip(ours, src)]
+    return None
 
 
 def session_status(cov: dict) -> tuple[str, dict, dict]:
@@ -441,8 +480,8 @@ def verification_banner(ck: dict[str, Any]) -> str:
             parts.append(f"exact on the last run in {run_exact} (the counter restarted; its value equals the "
                          "last calls to the token)")
         if inc_ok:
-            parts.append(f"consistent snapshot to snapshot in {inc_ok} (the counter started above or below "
-                         "this file: usage carried in, or a resumed run)")
+            parts.append(f"consistent snapshot to snapshot in {inc_ok} (what both sides added between two "
+                         "snapshots of one run agrees, apart from calls no line records)")
         if restart:
             parts.append(f"counter restarted in {restart}, nothing comparable")
         if single:
@@ -496,23 +535,24 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
             f"their output ({fmt_tokens(t['inexact_output_logged'])} as logged) is a lower bound. Input is exact."
         )
     if ck["sessions_checkable"]:
-        gap = ck["source_output"] - ck["ours_output"]
-        out.append(
-            f"  Checked against Claude Code's own counter (cost-state records) in {ck['sessions_checkable']} of "
-            f"{ck['sessions_in_period']} sessions: input and cache match to the token in "
-            f"{ck['sessions_input_exact']}; output {fmt_tokens(ck['ours_output'])} here vs "
-            f"{fmt_tokens(ck['source_output'])} there"
-            + (f" ({fmt_tokens(gap)} not visible in the per-call lines)" if gap > 0 else "")
-            + ("" if gap > 0 else " (match)") + "."
-        )
-        missing = ck["counter_input"] - ck["lines_input"]
-        if missing > 0:
+        out.append(f"  Checked against Claude Code's own counter (cost-state records) in {ck['sessions_checkable']} of "
+                   f"{ck['sessions_in_period']} sessions; the verdict is on the first line.")
+        fl = ck["floor"]
+        if fl["sessions"]:
+            ln, gp = fl["lines"], fl["gap"]
+            ic_lines, ic_gap = sum(ln[:3]), sum(gp[:3])
+            pin = 100 * ic_gap / ic_lines if ic_lines else 0.0
+            pout = 100 * gp[3] / ln[3] if ln[3] else 0.0
             out.append(
-                f"    Claude Code's counter holds {fmt_tokens(missing)} input tokens (cache included) that no call "
-                "line records, in the checked sessions. They are not in the totals or categories above, because "
-                "they can't be attributed to a call. Known causes: tools that run a model themselves (WebFetch "
-                "reading a page). `tokentrail diagnose <session>` shows which models."
+                f"    How far below the real usage the totals are: where both sides cover the same calls "
+                f"({fl['sessions']} sessions: exact, exact on the last run, or between snapshots of one run), "
+                f"Claude Code's counter holds {fmt_tokens(ic_gap)} more input and cache ({pin:+.2f}%) and "
+                f"{fmt_tokens(gp[3])} more output ({pout:+.1f}%) than the call lines. That is usage no call line "
+                "records (tools that run a model themselves, sub-agent output logged mid-stream), not in the "
+                "totals or categories above. Read the totals as a floor by about that much."
             )
+        else:
+            out.append("    No session lets both sides cover the same calls: how much the call lines miss is unknown.")
         if ck["mismatched"]:
             out.append("    sessions that disagree, largest first (input + cache, ours minus counter; + = we count more):")
             for m in ck["mismatched"][:15]:

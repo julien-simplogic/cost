@@ -39,7 +39,8 @@ def test_side_calls_counted_only_by_claude_code_are_shown_not_called_a_bug(env, 
     assert "The totals below are a MINIMUM" in banner
     assert "one side only (not compared): claude-haiku-4-5-20251001" in banner
     assert "MISMATCH" not in out
-    assert "holds 144k input tokens (cache included) that no call line records" in out
+    # lines: 2 + 30,000 + 30,000 + 400 = 60,402 input and cache; the counter has 144,000 more
+    assert "holds 144k more input and cache (+238.39%) and 12k more output (+2400.0%)" in out
 
 
 def test_more_than_a_single_snapshot_is_not_proof_of_an_error(env, capsys):
@@ -324,3 +325,28 @@ def test_a_restarted_run_that_matches_exactly_counts_as_exact_on_that_run(env, c
     main(["check"])
     row = [l for l in capsys.readouterr().out.splitlines() if l.startswith("2.1.288")][-1].split()
     assert row[:4] == ["2.1.288", "1", "0", "1"]  # sessions, exact, exact on last run
+
+
+def test_floor_is_measured_only_where_both_sides_cover_the_same_calls(env, capsys):
+    # A: every line exact, plus 1,000 tokens of a hidden call on another model
+    a = FakeSession(env.projects, project="acme-webshop")
+    a.prompt("x")
+    a.call(new=0, write=10_000, out=100)
+    u = a.true_usage["claude-opus-5-5"]
+    a.cost_state({"claude-opus-5-5": {"inputTokens": u[0], "cacheReadInputTokens": u[1],
+                                      "cacheCreationInputTokens": u[2], "outputTokens": u[3]},
+                  "claude-haiku-4-5-20251001": {"inputTokens": 1_000, "cacheReadInputTokens": 0,
+                                                "cacheCreationInputTokens": 0, "outputTokens": 0}})
+    a.write()
+    # B: one snapshot, counter 1,000,000 above the file (usage carried in): must not count
+    b = FakeSession(env.projects, project="harbor-api")
+    b.prompt("y")
+    b.call(new=0, write=5_000, out=100)
+    v = b.true_usage["claude-opus-5-5"]
+    b.cost_state({"claude-opus-5-5": {"inputTokens": v[0], "cacheReadInputTokens": v[1] + 1_000_000,
+                                      "cacheCreationInputTokens": v[2], "outputTokens": v[3]}})
+    b.write()
+    main(["report", "--since", "all"])
+    out = capsys.readouterr().out
+    # only A: 1,000 more on 10,000 recorded = +10.00%; B's million is left out
+    assert "(1 sessions: exact" in out and "holds 1k more input and cache (+10.00%)" in out

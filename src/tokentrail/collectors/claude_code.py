@@ -43,7 +43,7 @@ SOURCE = "claude-code"
 VERIFIED_VERSION = "2.1.288"
 # Bump whenever parsing or the counter check changes: stored sessions parsed by an
 # older revision are read again, or reports would show results of the old code.
-PARSER_REVISION = 8
+PARSER_REVISION = 9
 
 # Record types we know and skip on purpose (they carry no usage).
 KNOWN_IGNORED = frozenset(
@@ -605,13 +605,21 @@ def _counter_checks(checkpoints, groups, records, tool_uses, agent_meta):
             for i, k in enumerate(("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")):
                 target[i] += _int(u.get(k)) or 0
     acc = [0, 0, 0]
+    out_acc = 0
     suffix = None
     ordered = sorted((k for k in covered if k in by_turn), key=lambda k: (lines[k], groups[k].order))
     for n, k in enumerate(reversed(ordered), 1):
         r = by_turn[k]
         acc = [acc[0] + r.input_new, acc[1] + r.input_cache_read, acc[2] + r.input_cache_write]
+        out_acc += r.output_total
         if acc == target:
-            suffix = {"calls": n, "since": r.timestamp, "of": len(ordered)}
+            # what both sides hold over that final run, every model of the counter included,
+            # so the counter's surplus there is usage no call line records
+            counter_all = [sum((_int(u.get(f)) or 0) for u in usage.values() if isinstance(u, dict))
+                           for f in ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
+                                     "outputTokens")]
+            suffix = {"calls": n, "since": r.timestamp, "of": len(ordered),
+                      "ours": acc + [out_acc], "counter": counter_all}
             break
         if any(a > t for a, t in zip(acc, target)):
             break

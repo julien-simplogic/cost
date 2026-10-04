@@ -80,8 +80,9 @@ def test_report_marks_recovered_output_and_says_how_much(env, capsys):
     assert "‡" in out
     assert "216 recovered for 1 sub-agent calls" in out
     assert "lower bound" in out
-    assert "match to the token in 1" in out
-    assert "87 not visible in the per-call lines" in out
+    assert out.splitlines()[1].startswith("Verified")
+    # 87 output tokens the sub-agent produced and no line records, out of 1,002 recorded
+    assert "holds 0 more input and cache (+0.00%) and 87 more output (+8.7%)" in out
 
 
 def test_logged_only_ignores_recovered_output(env, capsys):
@@ -100,7 +101,7 @@ def test_input_mismatch_is_reported(env, capsys):
     _session(env.projects, counter_input_delta=5)
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
-    assert "match to the token in 0" in out
+    assert "exact in 0" in out.splitlines()[1]
     # signed and sized: we count 5 fewer input tokens than the counter
     assert "): input -5 (-<0.01%), output -87" in out
 
