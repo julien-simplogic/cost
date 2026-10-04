@@ -308,7 +308,7 @@ Three kinds of numbers, never mixed:
   even after 22 hours idle. One explanation was tested and ruled out: another
   session on the same model, active just before, keeping a shared prefix
   warm. The median is the same with one (23,985) and without (23,870). Where
-  those tokens come from is not in the transcripts.
+  those tokens come from is not in the transcripts ([open question](#open-questions)).
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
@@ -718,6 +718,30 @@ Honest options, none of them complete:
   do not, until enough estimates have met their outcome. Until `tokentrail
   score` says otherwise on your own history, read the turn interval as a
   guess with a stated basis.
+
+## Open questions
+
+**The block that survives a cache expiry.** About 24,000 tokens are still read
+from cache after an expiry (author's history, 445 expiries: p10 22,075,
+median 23,981, p90 30,857), even after 22 hours idle. The obvious candidate
+is the system prompt plus tool definitions. A test on the transcripts
+supports it without settling it:
+
+- The same exact values recur across sessions and projects (63 × 23,870,
+  46 × 22,799, 34 × 30,857 tokens…): a fixed piece of content, not something
+  that ages.
+- The value depends on the Claude Code version (median 30,857 on 2.1.276,
+  23,470 on 2.1.283).
+- A new session's very first call already reads it from cache (median 25,467
+  tokens; zero in 2 of 145 sessions).
+- But within one session, its expiries read the same value to the token in
+  only 46 of 82 sessions. Tools added or dropped mid-session (MCP servers,
+  skills) could explain the rest; the transcripts do not record the tool
+  list, so this cannot be checked from them.
+
+Why it outlives the cache TTL even with no other session active is not
+explained either. tokentrail uses the measured median and does not depend on
+the answer.
 
 ## Development
 
