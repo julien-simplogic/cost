@@ -313,7 +313,9 @@ Three kinds of numbers, never mixed:
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
   the 12.5th, 50th and 87.5th percentiles of main-thread turns over your past
-  tasks, never a mean, and multiplies by the context size. That pair, not
+  tasks that were at the same place in their session (the first task of a
+  session runs far longer than the next ones), never a mean, and multiplies by
+  the context size. That pair, not
   p10-p90, is the one that held about 80% of outcomes in a backtest (below).
   When turns spread over two orders of magnitude (high bound ≥ 100 × low),
   it says so and gives no interval: one that wide covers everything and says
@@ -356,12 +358,20 @@ only, with 95% intervals from resampling sessions):
 - *The longer a task has run, the longer it still runs.* Median turns still
   ahead: 4 after 1 turn, 5 after 3, 7 after 5, 11 after 10 (p90 55).
 - *The first task of a session is the long one:* median 22 turns, p90 108
-  (146 sessions), against 4 to 7 for later ones. The previous task's turns
-  and the rank in the session improve the interval score (by 2.7 and 2.9, both
-  intervals below 0) but leave coverage at 86-87%, outside the 75-85% asked
-  for. Prompt length, files mentioned, slash command, project and model do
-  not improve it. Short follow-ups (19 tasks) and pasted errors (17) are too
-  rare to tell.
+  (146 sessions), against 4 to 7 for later ones. With the p12.5-p87.5
+  interval, two signs pass the criterion (interval score better than all
+  earlier tasks, with a session-resampled 95% interval below 0, and coverage
+  75-85%): the rank of the task in its session (-2.90 [-5.67, -0.72],
+  coverage 84.3%) and the previous task's turns (-2.77 [-4.98, -1.11],
+  82.8%). `estimate` uses the rank: turns come from past tasks that were at
+  the same place in their session (1st, 2nd-3rd, 4th-10th, 11th-30th, 31st
+  on), when there are 30 of them. Two cautions: on the newest 30% alone (1,175
+  tasks, 44 sessions) neither sign, nor a depth 2-3 quantile tree on both,
+  beat all-tasks quantiles on interval score (60.2 against 60.5, intervals
+  overlapping), they only narrowed the interval (25 to 20 turns); and the
+  tree was not kept. Prompt length, files mentioned, slash command, project
+  and model do not help; short follow-ups (19 tasks) and pasted errors (17)
+  are too rare to tell.
 - *Cost:* turns × context gives the best interval score of four methods
   ($17.97, against $18.70 for quantiles of the cost itself and $32.46 for
   cost scaled by the first input), with 78.5% coverage, but its median runs

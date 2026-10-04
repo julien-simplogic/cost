@@ -213,3 +213,23 @@ def test_a_guessed_family_is_recorded_but_not_used_as_the_basis(env, store):
     p = _est(store, s, text="refactor the cart")["predicted"]
     assert p["family"] == "refactor" and p["family_source"] == "guessed from your text"
     assert p["basis_is_family"] is False and p["basis"].startswith("all ")
+
+
+def test_turns_come_from_tasks_at_the_same_place_in_their_session(env, store):
+    for k in range(35):  # first task long, second short, in every session
+        s = FakeSession(env.projects, project="acme-webshop", start=T0 + timedelta(hours=k))
+        for n in (20, 2):
+            s.prompt("work")
+            for _ in range(n):
+                s.call(read=20_000, write=100, out=100)
+            s.tick(60)
+        s.write()
+    cur = FakeSession(env.projects, project="harbor-api", start=T0 + timedelta(days=5))
+    cur.prompt("first thing")
+    cur.call(new=2, read=30_000, write=500, out=300)
+    cur.write()
+    p = _est(store, cur)["predicted"]
+    # the next task is this session's 2nd: its basis is the 35 past 2nd tasks, all of 2 turns
+    assert p["rank_in_session"] == 2
+    assert p["basis"] == "35 past tasks that were the 2nd or 3rd of their session"
+    assert p["turns"]["p50"] == 2

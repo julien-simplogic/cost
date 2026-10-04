@@ -173,9 +173,13 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     if family is None:
         family = guess_family_from_text(inp.text)
     # past tasks; the one still running in this session is not history yet
-    hist = [t for t in group_tasks(all_rows, tasks)
-            if t.first_input > 0 and t.tracked and t.task_id != last.task_id]
+    all_tasks = [t for t in group_tasks(all_rows, tasks) if t.first_input > 0 and t.tracked]
+    hist = [t for t in all_tasks if t.task_id != last.task_id]
     fam_hist = [t for t in hist if t.family == family]
+    ranks = task_ranks(all_tasks)
+    rank_next = sum(1 for t in all_tasks if t.session_key == session_key) + 1
+    slice_next = rank_slice(rank_next)
+    rank_hist = [t for t in hist if rank_slice(ranks[t.task_id]) == slice_next]
     # A family guessed from your text is recorded (score checks it) but not used as the
     # basis: on real history, text-guessed families did not separate turns (all medians 4-5,
     # except 'review' at 11 with p10-p90 2-57). A family you declare is used.
@@ -184,8 +188,13 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     elif inp.family:
         basis, basis_label = hist, (f"all {len(hist)} past tasks ('{family}' has only {len(fam_hist)}, "
                                     f"need {MIN_FAMILY_SAMPLES})")
+    elif len(rank_hist) >= MIN_RANK_SAMPLES:
+        # The one sign that held up in the leak-free backtest (scripts/study.py 6): where the
+        # task falls in its session. The first one is the long one (median 22 turns, against
+        # 4 to 7 for later ones, on the author's history).
+        basis, basis_label = rank_hist, f"{len(rank_hist)} past tasks that were {RANK_WORDS[slice_next]}"
     else:
-        basis, basis_label = hist, f"all {len(hist)} past tasks (a guessed family is not used: it did not separate turns)"
+        basis, basis_label = hist, f"all {len(hist)} past tasks"
 
     # Turns, not output: the number of main-thread calls decides how many times
     # the context is re-read. Their spread decides whether an interval means anything.
@@ -279,6 +288,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         },
         "predicted": {
             "validated": False,
+            "rank_in_session": rank_next,
             "family": family,
             "family_source": family_source,
             "basis": basis_label,
@@ -299,6 +309,32 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         },
         "warnings": warnings,
     }
+
+
+MIN_RANK_SAMPLES = 30  # as the study: a slice with fewer past tasks falls back to all of them
+RANK_SLICES = ((1, "1st"), (3, "2-3"), (10, "4-10"), (30, "11-30"))
+RANK_WORDS = {"1st": "the first of their session", "2-3": "the 2nd or 3rd of their session",
+              "4-10": "the 4th to 10th of their session", "11-30": "the 11th to 30th of their session",
+              "31+": "the 31st or later of their session"}
+
+
+def rank_slice(rank: int) -> str:
+    for limit, label in RANK_SLICES:
+        if rank <= limit:
+            return label
+    return "31+"
+
+
+def task_ranks(task_stats) -> dict[str, int]:
+    """Position of each task in its session, 1 for the first."""
+    by: dict[str, list] = {}
+    for t in task_stats:
+        by.setdefault(t.session_key, []).append(t)
+    out = {}
+    for ts in by.values():
+        for i, t in enumerate(sorted(ts, key=lambda t: (t.started, t.task_id)), 1):
+            out[t.task_id] = i
+    return out
 
 
 def _certain(gap, ttl, warm, model, last, input_next, cached, floor_cost, warm_cost, t_last) -> list[str]:
