@@ -12,6 +12,7 @@ Steps (numbering of the 4 Oct 2026 plan):
   6  candidate signs, one at a time, then a shallow quantile tree if several pass
      (`6 --q 12.5`: with the p12.5-p87.5 interval step 3 chose)
   8  the ~24k block that survives an expiry: what happens between two expiries when it changes
+  9  new levers: more context signs, nearest past prompts, the task's first turns, cost bias
 """
 
 from __future__ import annotations
@@ -80,6 +81,8 @@ def normalize(text: str) -> str:
 
 _ERROR = re.compile(r"Traceback \(most recent call last\)|\b\w*(Error|Exception)\b:|\bFAILED\b|panicked at|"
                     r"^\s+at .+:\d+|error\[E\d+\]|npm ERR!|fatal:", re.MULTILINE)
+_ITEM = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+\S", re.MULTILINE)
+_WORD = re.compile(r"[^\W\d_]{3,}")
 _PATH = re.compile(r"(?:^|\s)@?[\w./-]+\.[A-Za-z0-9]{1,6}\b")
 
 
@@ -90,6 +93,9 @@ class Prompt:
     error: bool
     n_files: int
     command: Optional[str]
+    n_items: int = 0  # lines that start a list item: "- ", "* ", "1. "
+    question: bool = False  # ends with a question mark
+    terms: frozenset = frozenset()  # lowercase words of 3+ letters, in memory only (step 9 neighbours)
 
 
 def prompt_features(followups: set[str]) -> dict[str, Prompt]:
@@ -118,7 +124,9 @@ def prompt_features(followups: set[str]) -> dict[str, Prompt]:
                     continue
                 m = re.search(r"<command-name>/?([\w:.-]+)</command-name>", c)
                 out[pid] = Prompt(len(c), normalize(c) in followups, bool(_ERROR.search(c)),
-                                  len(set(_PATH.findall(c))), m.group(1) if m else None)
+                                  len(set(_PATH.findall(c))), m.group(1) if m else None,
+                                  len(_ITEM.findall(c)), c.rstrip().endswith("?"),
+                                  frozenset(_WORD.findall(c.lower())))
     return out
 
 
@@ -699,7 +707,218 @@ def step8(_tasks: list[T]) -> None:
     print("it does not prove it.")
 
 
-STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8}
+# ------------------------------------------------------------------ step 9
+
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+AGENT_TOOLS = {"Task", "Agent"}
+
+
+def _tools(rows, first: Optional[int] = None) -> list[str]:
+    main = [r for r in rows if r.trigger != "subagent"]
+    if first is not None:
+        main = main[:first]
+    return [n for r in main for n in (r.extra.get("tools") or [])]
+
+
+def context_signs(tasks: list[T]) -> dict[str, dict[str, str]]:
+    """Signs known before sending, beyond step 6: idle time since the previous task, what that
+    task did, the context size, how the prompt is written."""
+    out: dict[str, dict[str, str]] = {k: {} for k in (
+        "idle since previous task", "previous task edited files", "previous task launched sub-agents",
+        "context at start", "list items in prompt", "prompt is a question")}
+    for ts in by_session(tasks).values():
+        for i, t in enumerate(ts):
+            p = ts[i - 1] if i else None
+            if p is not None:
+                end, start = parse_ts(max(r.ts for r in p.rows)), parse_ts(t.started)
+                gap = (start - end).total_seconds() if end and start else None
+                out["idle since previous task"][t.task_id] = _bucket(
+                    gap, [(60, "<1 min"), (300, "1-5 min"), (1800, "5-30 min"), (7200, "30 min-2 h"),
+                          (float("inf"), "2 h+")]) if gap is not None else None
+                pt = _tools(p.rows)
+                out["previous task edited files"][t.task_id] = "yes" if WRITE_TOOLS & set(pt) else "no"
+                out["previous task launched sub-agents"][t.task_id] = "yes" if AGENT_TOOLS & set(pt) else "no"
+            else:
+                for k in ("idle since previous task", "previous task edited files",
+                          "previous task launched sub-agents"):
+                    out[k][t.task_id] = "first of session"
+            out["context at start"][t.task_id] = _bucket(
+                t.first_input, [(30_000, "<30k"), (60_000, "30-60k"), (120_000, "60-120k"),
+                                (250_000, "120-250k"), (float("inf"), "250k+")])
+            if t.prompt:
+                out["list items in prompt"][t.task_id] = _bucket(
+                    t.prompt.n_items, [(0, "0"), (2, "1-2"), (5, "3-5"), (float("inf"), "6+")])
+                out["prompt is a question"][t.task_id] = "yes" if t.prompt.question else "no"
+    for k in out:
+        out[k] = {tid: v for tid, v in out[k].items() if v is not None}
+    return out
+
+
+def neighbours(tasks: list[T], k: int = 30, min_sim: float = 0.1):
+    """For each task with a prompt: quantiles of the turns of the k earlier prompts most alike in
+    words (TF-IDF cosine), leak-free. Word frequencies come from the whole history (not the turns).
+    Returns (task, base quantiles, neighbour quantiles or None, best similarity)."""
+    import math
+
+    docs = [t for t in tasks if t.prompt and t.prompt.terms]
+    df = Counter(w for t in docs for w in t.prompt.terms)
+    n = len(docs)
+    common = {w for w, c in df.items() if c > 0.2 * n}  # words in a fifth of all prompts say nothing
+    idf = {w: math.log(n / c) for w, c in df.items() if w not in common}
+    vec = {}
+    for t in docs:
+        v = {w: idf[w] for w in t.prompt.terms if w in idf}
+        norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        vec[t.task_id] = {w: x / norm for w, x in v.items()}
+    index: dict[str, list[tuple[int, float]]] = {}
+    seen: list[T] = []
+    seen_sorted: list[int] = []
+    out = []
+    for t in tasks:
+        v = vec.get(t.task_id)
+        if v is not None and len(seen) >= MIN_HISTORY:
+            scores: dict[int, float] = {}
+            for w, x in v.items():
+                for j, y in index.get(w, ()):
+                    scores[j] = scores.get(j, 0.0) + x * y
+            top = sorted(((sc, j) for j, sc in scores.items() if sc >= min_sim), reverse=True)[:k]
+            base = tuple(percentile_sorted(seen_sorted, q) for q in qs3())
+            near = None
+            if len(top) >= k:
+                near = _quantiles([seen[j].turns for _, j in top])
+            out.append((t, base, near, top[0][0] if top else 0.0))
+        if v is not None:
+            j = len(seen)
+            seen.append(t)
+            for w, x in v.items():
+                index.setdefault(w, []).append((j, x))
+        bisect.insort(seen_sorted, t.turns)
+    return out
+
+
+def early_signs(tasks: list[T], k: int) -> dict[str, dict[str, str]]:
+    """What a task's first k main-thread calls did, for tasks that reached k."""
+    out: dict[str, dict[str, str]] = {f"first {k} turns: edited a file": {}, f"first {k} turns: planned (TodoWrite)": {},
+                                      f"first {k} turns: launched a sub-agent": {},
+                                      f"first {k} turns: shell commands": {}}
+    for t in tasks:
+        if t.turns < k:
+            continue
+        tl = _tools(t.rows, k)
+        out[f"first {k} turns: edited a file"][t.task_id] = "yes" if WRITE_TOOLS & set(tl) else "no"
+        out[f"first {k} turns: planned (TodoWrite)"][t.task_id] = "yes" if "TodoWrite" in tl else "no"
+        out[f"first {k} turns: launched a sub-agent"][t.task_id] = "yes" if AGENT_TOOLS & set(tl) else "no"
+        b = tl.count("Bash")
+        out[f"first {k} turns: shell commands"][t.task_id] = "0" if b == 0 else ("1-2" if b <= 2 else "3+")
+    return out
+
+
+def judge_sign(tasks: list[T], name: str, label: dict[str, str], target=lambda t: t.turns, indent="   ") -> bool:
+    """Per-slice distribution, then the paired leak-free backtest against all earlier tasks."""
+    groups: dict[str, list[float]] = {}
+    for t in tasks:
+        if t.task_id in label:
+            groups.setdefault(label[t.task_id], []).append(target(t))
+    print(f"\n-- {name} ({len(label)} tasks with a value)")
+    for lab, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:8]:
+        print(indent + dist(v, lab[:28]))
+    seen_all: list[float] = []
+    seen: dict[str, list[float]] = {}
+    pairs = []
+    for t in tasks:
+        lab = label.get(t.task_id)
+        if lab is not None and len(seen_all) >= MIN_HISTORY:
+            base = tuple(percentile_sorted(seen_all, q) for q in qs3())
+            h = seen.get(lab, [])
+            mine = tuple(percentile_sorted(h, q) for q in qs3()) if len(h) >= MIN_BIN else base
+            pairs.append((t, base, mine))
+        if lab is not None:
+            y = target(t)
+            bisect.insort(seen_all, y)
+            bisect.insort(seen.setdefault(lab, []), y)
+    if not pairs:
+        return False
+    diffs = [(t.key, metrics.interval_score(m[0], target(t), m[2]) - metrics.interval_score(b[0], target(t), b[2]))
+             for t, b, m in pairs]
+    stat = lambda xs: metrics.mean([d for _, d in xs])  # noqa: E731
+    gain, ci = stat(diffs), metrics.bootstrap_by_session(diffs, lambda x: x[0], stat, n=BOOT)
+    cov = metrics.coverage([(m[0], target(t), m[2]) for t, _, m in pairs])
+    ok = bool(ci and ci[1] < 0 and cov is not None and 0.75 <= cov <= 0.85)
+    print(indent + score_line("baseline (all earlier)", [(t.key, b[0], target(t), b[2], b[1]) for t, b, _ in pairs]))
+    print(indent + score_line("by this sign", [(t.key, m[0], target(t), m[2], m[1]) for t, _, m in pairs]))
+    if ci:
+        print(f"{indent}interval score difference {gain:+.2f} [{ci[0]:+.2f}, {ci[1]:+.2f}]; "
+              f"{'PASSES' if ok else 'does not pass'}")
+    return ok
+
+
+def step9(tasks: list[T]) -> None:
+    print(f"=== Step 9: new levers (interval p{Q_LO:g}-p{100 - Q_LO:g}, target 80%, same criterion as step 6)")
+    passed = []
+
+    print("\n## 9a. more signs known before sending")
+    for name, label in context_signs(tasks).items():
+        if judge_sign(tasks, name, label):
+            passed.append(name)
+
+    print("\n## 9b. the 30 earlier prompts most alike in words (computed in memory, nothing stored)")
+    rows = neighbours(tasks)
+    with_near = [(t, b, m) for t, b, m, _ in rows if m is not None]
+    print(f"   prompts with 30 earlier neighbours of similarity >= 0.1: {len(with_near)} of {len(rows)}")
+    if with_near:
+        print("   " + score_line("baseline (all earlier)", [(t.key, b[0], t.turns, b[2], b[1]) for t, b, _ in with_near]))
+        print("   " + score_line("nearest 30 prompts", [(t.key, m[0], t.turns, m[2], m[1]) for t, _, m in with_near]))
+        diffs = [(t.key, metrics.interval_score(m[0], t.turns, m[2]) - metrics.interval_score(b[0], t.turns, b[2]))
+                 for t, b, m in with_near]
+        stat = lambda xs: metrics.mean([d for _, d in xs])  # noqa: E731
+        ci = metrics.bootstrap_by_session(diffs, lambda x: x[0], stat, n=BOOT)
+        cov = metrics.coverage([(m[0], t.turns, m[2]) for t, _, m in with_near])
+        ok = bool(ci and ci[1] < 0 and 0.75 <= cov <= 0.85)
+        if ci:
+            print(f"   interval score difference {stat(diffs):+.2f} [{ci[0]:+.2f}, {ci[1]:+.2f}]; "
+                  f"{'PASSES' if ok else 'does not pass'}")
+        # as it would be used: the neighbours when 30 are found, all earlier tasks otherwise
+        mixed = [(t.key, (m or b)[0], t.turns, (m or b)[2], (m or b)[1]) for t, b, m, _ in rows]
+        print("   " + score_line("as used: neighbours or all", mixed))
+        print("   " + score_line("baseline on the same tasks", [(t.key, b[0], t.turns, b[2], b[1]) for t, b, _, _ in rows]))
+        sims = sorted(sim for *_, sim in rows)
+        print(f"   best similarity found: median {percentile_sorted(sims, 50):.2f}, p90 {percentile_sorted(sims, 90):.2f}")
+        if ok:
+            passed.append("nearest 30 prompts")
+
+    print("\n## 9c. the task's first turns: turns still ahead, by what the first k turns did")
+    for k in (2, 3):
+        reached = [t for t in tasks if t.turns >= k]
+        for name, label in early_signs(reached, k).items():
+            if judge_sign(reached, name, label, target=lambda t, k=k: t.turns - k):
+                passed.append(name)
+
+    print("\n## 9d. cost: turns x context, corrected by the ratio actual / estimate of earlier tasks")
+    priced = [t for t in tasks if t.floor > 0 and t.cost > 0]
+    tq = {t.task_id: v for t, v in leak_free(priced, lambda t: t.turns, quantiles=qs3())}
+
+    def raw(t, n):
+        return t.floor + (max(n, 1) - 1) * t.reread
+
+    ratios: list[float] = []
+    before, after = [], []
+    for t in priced:
+        if t.task_id in tq and len(ratios) >= MIN_HISTORY:
+            lo, mid, hi = (raw(t, n) for n in tq[t.task_id])
+            m = percentile_sorted(ratios, 50)
+            before.append((t.key, lo, t.cost, hi, mid))
+            after.append((t.key, lo * m, t.cost, hi * m, mid * m))
+        if t.task_id in tq:
+            bisect.insort(ratios, t.cost / raw(t, tq[t.task_id][1]))
+    if before:
+        print("   " + score_line("turns x context (today)", before, unit="$"))
+        print("   " + score_line("x median earlier ratio", after, unit="$"))
+        print(f"   the multiplier at the end of the history: x{percentile_sorted(ratios, 50):.2f}")
+
+    print(f"\nsigns that pass: {', '.join(passed) or 'none'}")
+
+
+STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8, "9": step9}
 
 
 def main(argv: list[str]) -> None:

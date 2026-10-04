@@ -158,3 +158,20 @@ def test_step6_reruns_with_the_recalibrated_interval(study, capsys):
     out = capsys.readouterr().out
     assert "Interval: p12.5-p87.5 for the baseline and every sign alike" in out
     assert "-- first of session" in out
+
+
+def test_step9_runs_and_prints_no_prompt_words(study, capsys):
+    study.main(["9", "--q", "12.5"])
+    study.Q_LO = 10.0
+    out = capsys.readouterr().out
+    assert "## 9a." in out and "## 9b." in out and "## 9c." in out and "## 9d." in out
+    for word in ("failing", "payments", "Traceback", "refactor payments"):
+        assert word not in out
+
+
+def test_neighbours_only_look_back(study):
+    tasks = study.load()
+    for t, base, near, _ in study.neighbours(tasks, k=3, min_sim=0.0):
+        if near is not None:
+            earlier = [x.turns for x in tasks[:tasks.index(t)]]
+            assert min(earlier) <= near[0] and near[2] <= max(earlier)
