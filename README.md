@@ -774,7 +774,12 @@ supports it without settling it:
   list, so this cannot be checked from them.
 
 Why it outlives the cache TTL even with no other session active is not
-explained either. tokentrail uses the measured median and does not depend on
+explained either. **Unverified hypothesis:** the prefix is kept warm by other
+requests from the same account that leave no transcript on this machine (a
+session on another computer, a cloud session, Claude Code's own background
+calls). The test above only saw local sessions, so it cannot rule this out.
+`scripts/study.py 8` lists what the transcripts show between two expiries
+whose block changed or stayed. tokentrail uses the measured median and does not depend on
 the answer.
 
 **The cache breaks with no visible cause.** On the author's history, 169

@@ -131,3 +131,20 @@ def test_step6_judges_signs_against_the_baseline_on_the_same_tasks(study, capsys
     out = capsys.readouterr().out
     assert "-- error pasted" in out and "interval score difference" in out
     assert "signs that pass:" in out
+
+
+def test_step8_runs_and_names_no_mcp_server(env, capsys):
+    from tokentrail.cli import main as cli
+
+    s = FakeSession(env.projects, start=T0)
+    for i in range(4):
+        s.prompt("go")
+        s.call(new=2, read=24_000, write=30_000, ttl="5m",
+               tools=(("mcp__clientserver__query", {}),) if i == 2 else ())
+        s.tick(3600)
+    s.write()
+    cli(["ingest"])
+    study = _study()
+    study.step8([])
+    out = capsys.readouterr().out
+    assert "pairs of consecutive expiries" in out and "clientserver" not in out

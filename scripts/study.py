@@ -10,6 +10,7 @@ Steps (numbering of the 4 Oct 2026 plan):
   4  turns still ahead once a task has made k turns
   5  cost rather than turns: context growth per turn, and which cost estimate does best
   6  candidate signs, one at a time, then a shallow quantile tree if several pass
+  8  the ~24k block that survives an expiry: what happens between two expiries when it changes
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import bisect
 from collections import Counter
 
 from tokentrail import metrics, paths, prices
-from tokentrail.analysis import enrich, group_tasks, parse_ts, percentile, percentile_sorted
+from tokentrail.analysis import enrich, expiries, group_tasks, parse_ts, percentile, percentile_sorted
 from tokentrail.collectors import claude_code
 
 HERE = Path(__file__).resolve().parent
@@ -596,7 +597,99 @@ def quantile_tree(tasks: list[T], labels: dict[str, dict[str, str]]) -> None:
     walk(tree)
 
 
-STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6}
+# ------------------------------------------------------------------ step 8
+
+
+def _events(path: Path, t0: str, t1: str) -> set[str]:
+    """Kinds of things the transcript shows strictly after t0 and up to t1. Names only:
+    record types, attachment and system subtypes, tool names (MCP servers hashed)."""
+    out: set[str] = set()
+    versions, models, cwds, branches = set(), set(), set(), set()
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            ts = o.get("timestamp")
+            if not isinstance(ts, str) or not (t0 < ts <= t1):
+                continue
+            typ = o.get("type")
+            for k, bag in (("version", versions), ("cwd", cwds), ("gitBranch", branches)):
+                if isinstance(o.get(k), str):
+                    bag.add(o[k])
+            if typ == "attachment" and isinstance(o.get("attachment"), dict):
+                out.add(f"attachment:{o['attachment'].get('type')}")
+            elif typ == "system":
+                out.add(f"system:{o.get('subtype')}")
+            elif typ not in ("user", "assistant"):
+                out.add(f"record:{typ}")
+            if o.get("isCompactSummary"):
+                out.add("compaction")
+            msg = o.get("message") if isinstance(o.get("message"), dict) else {}
+            if typ == "assistant":
+                if isinstance(msg.get("model"), str):
+                    models.add(msg["model"])
+                for b in msg.get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        n = str(b.get("name"))
+                        if n.startswith("mcp__"):
+                            out.add("tool:mcp " + anon(n.split("__")[1]))
+                        elif n in ("ToolSearch", "Skill", "Task", "Agent", "WebFetch", "WebSearch"):
+                            out.add(f"tool:{n}")
+    for name, bag in (("Claude Code version changed", versions), ("model changed", models),
+                      ("working directory changed", cwds), ("git branch changed", branches)):
+        if len(bag) > 1:
+            out.add(name)
+    return out
+
+
+def step8(_tasks: list[T]) -> None:
+    print("=== Step 8: the block read after an expiry, between two expiries of the same session")
+    con = open_db()
+    table = prices.load()
+    meta = load_tasks_meta(con)
+    rows = enrich(con.execute("SELECT * FROM records ORDER BY ts, rowid").fetchall(), table, meta)
+    files = {f"{claude_code.SOURCE}:{sf.project_dir}/{sf.session_id}": sf.main
+             for sf in claude_code.discover(paths.claude_code_dir()) if sf.main}
+    by: dict[tuple, list] = {}
+    for e in expiries(rows):
+        by.setdefault((e.session_key, e.model), []).append(e)
+    pairs = []
+    for (key, _), es in by.items():
+        es.sort(key=lambda e: e.ts)
+        path = files.get(key)
+        if path is None:
+            continue
+        for a, b in zip(es, es[1:]):
+            # only the block: an expiry that re-read far more than ~24k (a whole context) is left out
+            if a.read > 60_000 or b.read > 60_000:
+                continue
+            pairs.append((a.read == b.read, abs(b.read - a.read), _events(path, a.ts, b.ts)))
+    same = [p for p in pairs if p[0]]
+    diff = [p for p in pairs if not p[0]]
+    print(f"pairs of consecutive expiries in one session (both reading under 60k): {len(pairs)}; "
+          f"same value to the token: {len(same)}; different: {len(diff)}")
+    if diff:
+        print(dist([d for _, d, _ in diff], "tokens of difference"))
+    kinds = Counter(k for _, _, ev in pairs for k in ev)
+    print("events seen between the two expiries, share of pairs where the block stayed / changed:")
+    print(f"   {'event':48}{'stayed':>12}{'changed':>12}")
+    for k, _ in sorted(kinds.items(), key=lambda kv: -abs(
+            sum(1 for p in diff if kv[0] in p[2]) / max(len(diff), 1)
+            - sum(1 for p in same if kv[0] in p[2]) / max(len(same), 1)))[:25]:
+        a = sum(1 for p in same if k in p[2])
+        b = sum(1 for p in diff if k in p[2])
+        print(f"   {k[:48]:48}{f'{a}/{len(same)}':>12}{f'{b}/{len(diff)}':>12}")
+    nothing = sum(1 for p in diff if not p[2])
+    print(f"changed with no event of these kinds in between: {nothing} of {len(diff)}")
+    print("An event far more frequent in 'changed' than in 'stayed' points at what alters the block;")
+    print("it does not prove it.")
+
+
+STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8}
 
 
 def main(argv: list[str]) -> None:
