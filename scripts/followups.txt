@@ -1,0 +1,32 @@
+# Short follow-ups: a prompt that is only one of these (case, spaces and final
+# punctuation ignored) continues the previous task rather than starting one.
+# One per line. Used by scripts/study.py; the tool itself does not read it yet.
+continue
+continues
+vas-y
+vas y
+go
+ok
+okay
+oui
+yes
+y
+d'accord
+daccord
+parfait
+merci
+thanks
+next
+suite
+la suite
+et ensuite
+on continue
+continue please
+please continue
+keep going
+do it
+fais-le
+fais le
+go ahead
+proceed
+lance
