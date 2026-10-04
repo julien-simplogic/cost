@@ -154,7 +154,7 @@ def hook_message(est: dict[str, Any]) -> str:
     lines = ["tokentrail: " + " ".join(est["certain"])]
     if p.get("turns"):
         basis = f"{p['samples']} past '{p['family']}' tasks" if p.get("basis_is_family") else (
-            f"all {p['samples']} past tasks, too few '{p['family']}' ones")
+            f"all {p['samples']} past tasks")
         t, c = p["turns"], p.get("cost")
         if t["spread"]:
             lines.append(f"  turns too spread to estimate ({basis}): p10 {t['p10']:.0f}, p90 {t['p90']:.0f}")

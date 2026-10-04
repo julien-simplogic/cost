@@ -325,9 +325,24 @@ Three kinds of numbers, never mixed:
   sub-agents have no fixed size, so they are left out of the ceiling, and the
   output says so.
 
-Families are question, refactor, review and measure. A past task's family is
-guessed from its first tool calls; for the estimate, from your text. Declare it
-when you know (`--family`, or `tokentrail tag <task> <family>` for past tasks).
+**Families do not separate turns, so a guessed family is not used.** Tasks fall
+into four families (question, refactor, review, measure). On the author's
+3,649 tasks with a prompt, the family guessed from the prompt text, the only
+one known before sending, gave nearly the same distribution everywhere:
+
+| family guessed from your text | tasks | p10 | median | p90 |
+|---|---|---|---|---|
+| question | 3,087 | 1 | 5 | 28 |
+| refactor | 227 | 1 | 5 | 42 |
+| review | 245 | 2 | 11 | 57 |
+| measure | 89 | 1 | 4 | 34 |
+
+Only "review" stands apart, and its interval still spans 2 to 57. The family
+guessed afterwards from a task's tool calls looks more telling, but partly by
+construction: "question" means few or no tool calls. It agreed with the text
+guess on 1,847 of 3,649 tasks. So `estimate` takes its turns from all your
+past tasks, and records the guessed family so `score` can keep checking. A
+family you declare (`--family`, or `tokentrail tag <task> <family>`) is used.
 
 **What a CLAUDE.md edit costs is measured, not asserted.** Where Claude Code
 puts `CLAUDE.md` in the prompt, and whether it re-reads it mid-session, is not
@@ -376,6 +391,8 @@ all          40    1       8   23      x23            14 / 26  wide
 (Invented demo data, as everywhere in this README.) Main-thread turns are the
 calls that each re-read the whole context, so the cost of a task is roughly
 turns × context size. Read the p90/p10 column before trusting any interval.
+Families here are guessed from each task's tool calls, which `estimate`
+cannot know before you send; see above why it does not use them.
 
 ### `tokentrail score`: the estimate grades itself
 
@@ -742,6 +759,16 @@ supports it without settling it:
 Why it outlives the cache TTL even with no other session active is not
 explained either. tokentrail uses the measured median and does not depend on
 the answer.
+
+**The cache breaks with no visible cause.** On the author's history, 169
+breaks cost $1,283.61. They are not spread out: one session holds 138 of them
+($1,062.76), three hold 155. 160 come from Claude Code 2.1.250; since 2.1.276
+there were 9. They share a shape: very late in long sessions (call index
+median 924), mid-task, 22 seconds after the previous call on a 1-hour cache,
+the previous call used `Read` (149 of 169, against 6% of calls overall),
+exactly the ~29,000-token block at the start of the prompt was still read
+(168 of 169), and in 82 the context had shrunk (median 1,789 tokens). Something
+early in the conversation was rewritten. What, the transcripts do not say.
 
 ## Development
 

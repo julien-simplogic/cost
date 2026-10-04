@@ -176,11 +176,16 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     hist = [t for t in group_tasks(all_rows, tasks)
             if t.first_input > 0 and t.tracked and t.task_id != last.task_id]
     fam_hist = [t for t in hist if t.family == family]
-    basis = fam_hist if len(fam_hist) >= MIN_FAMILY_SAMPLES else hist
-    basis_label = (
-        f"{len(fam_hist)} past '{family}' tasks" if basis is fam_hist
-        else f"all {len(hist)} past tasks ('{family}' has only {len(fam_hist)}, need {MIN_FAMILY_SAMPLES})"
-    )
+    # A family guessed from your text is recorded (score checks it) but not used as the
+    # basis: on real history, text-guessed families did not separate turns (all medians 4-5,
+    # except 'review' at 11 with p10-p90 2-57). A family you declare is used.
+    if inp.family and len(fam_hist) >= MIN_FAMILY_SAMPLES:
+        basis, basis_label = fam_hist, f"{len(fam_hist)} past '{family}' tasks"
+    elif inp.family:
+        basis, basis_label = hist, (f"all {len(hist)} past tasks ('{family}' has only {len(fam_hist)}, "
+                                    f"need {MIN_FAMILY_SAMPLES})")
+    else:
+        basis, basis_label = hist, f"all {len(hist)} past tasks (a guessed family is not used: it did not separate turns)"
 
     # Turns, not output: the number of main-thread calls decides how many times
     # the context is re-read. Their spread decides whether an interval means anything.

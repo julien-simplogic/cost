@@ -203,3 +203,11 @@ def test_cli_estimate_runs(env, capsys):
     assert "Computed" in out and "Unvalidated estimate" in out and "floor (exact)" in out
     assert "Predicted" not in out
     assert "harbor-api" in out  # picked by session id, not by the current directory
+
+
+def test_a_guessed_family_is_recorded_but_not_used_as_the_basis(env, store):
+    _history(env.projects)  # ten 'refactor' tasks, enough for a family basis
+    s = _current(env.projects)
+    p = _est(store, s, text="refactor the cart")["predicted"]
+    assert p["family"] == "refactor" and p["family_source"] == "guessed from your text"
+    assert p["basis_is_family"] is False and p["basis"].startswith("all ")
