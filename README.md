@@ -303,9 +303,12 @@ Three kinds of numbers, never mixed:
   3 hours), and a median 15% of the context was still read from cache. So
   "up to": after an expiry, part of the prompt can survive. When your history
   has enough expiries, a second line gives what survived after them and the
-  cost that implies. `score` also checks one explanation: whether another
-  session using the same model was active just before (a prompt prefix both
-  share, kept warm by the other).
+  cost that implies. On the author's history that part is nearly fixed in
+  size: after 445 expiries, p10 22,075 tokens, median 23,981, p90 30,857,
+  even after 22 hours idle. One explanation was tested and ruled out: another
+  session on the same model, active just before, keeping a shared prefix
+  warm. The median is the same with one (23,985) and without (23,870). Where
+  those tokens come from is not in the transcripts.
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
