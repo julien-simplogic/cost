@@ -81,3 +81,19 @@ def test_prompt_text_is_never_printed(study, capsys):
         if len(text) > 8:
             assert text not in out
     assert "proj0" not in out
+
+
+def test_leak_free_never_uses_the_task_itself_or_later_ones(study):
+    tasks = study.load()
+    rows = study.leak_free(tasks, lambda t: t.turns, quantiles=(0, 100))
+    for i, (t, (lo, hi)) in enumerate(rows):
+        idx = tasks.index(t)
+        earlier = [x.turns for x in tasks[:idx]]
+        assert (lo, hi) == (min(earlier), max(earlier))
+
+
+def test_step3_chooses_on_one_half_and_judges_on_the_other(study, capsys):
+    study.step3(study.load())
+    out = capsys.readouterr().out
+    assert "chosen on the first half" in out and "judged on the second half" in out
+    assert "p10-p90 (today)" in out and "(recalibrated)" in out

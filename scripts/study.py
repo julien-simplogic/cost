@@ -6,6 +6,7 @@ Prints numbers only; project names and MCP server names are replaced by hashes.
 
 Steps (numbering of the 4 Oct 2026 plan):
   1  task definition: short follow-ups merged into the previous task
+  3  recalibration: which quantiles give 80% in a leak-free backtest
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from tokentrail import paths, prices
-from tokentrail.analysis import enrich, group_tasks, parse_ts, percentile
+import bisect
+
+from tokentrail import metrics, paths, prices
+from tokentrail.analysis import enrich, group_tasks, parse_ts, percentile, percentile_sorted
 from tokentrail.collectors import claude_code
 
 HERE = Path(__file__).resolve().parent
@@ -212,7 +215,75 @@ def step1(tasks: list[T]) -> None:
     print("The tool's task definition is unchanged.")
 
 
-STEPS = {"1": step1}
+# ------------------------------------------------------------------ backtest helpers
+
+MIN_HISTORY = 8  # as estimate: fewer earlier tasks than this, no interval
+BOOT = 400
+
+
+def leak_free(tasks: list[T], target, quantiles=(10, 50, 90), basis_key=None, min_history: int = MIN_HISTORY):
+    """For each task, oldest first, the quantiles of `target` over the tasks before it
+    (only those sharing basis_key(task) when given). Returns (task, (q values...))."""
+    seen: dict = {}
+    out = []
+    for t in tasks:
+        k = basis_key(t) if basis_key else None
+        hist = seen.setdefault(k, [])
+        if len(hist) >= min_history:
+            out.append((t, tuple(percentile_sorted(hist, q) for q in quantiles)))
+        y = target(t)
+        if y is not None:
+            bisect.insort(hist, y)
+    return out
+
+
+def score_line(label: str, items, unit: str = "turns") -> str:
+    m = metrics.summarize(items, bootstrap=BOOT)
+
+    def ci(k, f):
+        c = m[k + "_ci"]
+        return f"[{f(c[0])}, {f(c[1])}]" if c else ""
+    pct = lambda x: f"{100 * x:.1f}%"  # noqa: E731
+    num = lambda x: f"{x:.1f}"  # noqa: E731
+    lg = lambda x: f"{x:+.2f}"  # noqa: E731
+    return (f"{label:30} n={m['n']:>5} ({m['sessions']} sessions)  coverage {pct(m['coverage'])} {ci('coverage', pct)}  "
+            f"interval score {num(m['interval_score'])} {ci('interval_score', num)}  width {num(m['width'])}  "
+            f"median abs error {num(m['abs_error'])}  median log err {lg(m['log_error'])} {ci('log_error', lg)}")
+
+
+# ------------------------------------------------------------------ step 3
+
+
+def step3(tasks: list[T]) -> None:
+    print("=== Step 3: recalibration of the turn interval (leak-free: each task from earlier tasks only)")
+    qs = [5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25]
+    rows = leak_free(tasks, lambda t: t.turns, quantiles=[q for q in qs] + [50] + [100 - q for q in qs])
+    if not rows:
+        print("not enough tasks")
+        return
+    half = len(rows) // 2
+    first, second = rows[:half], rows[half:]
+
+    def items(rs, i):
+        return [(t.key, v[i], t.turns, v[len(qs) + 1 + i], v[len(qs)]) for t, v in rs]
+
+    print("coverage by interval, whole history (nominal 80%):")
+    for i, q in enumerate(qs):
+        cov = metrics.coverage([(lo, y, hi) for _, lo, y, hi, _ in items(rows, i)])
+        print(f"  p{q:g}-p{100 - q:g}: {100 * cov:.1f}%")
+    covs = [metrics.coverage([(lo, y, hi) for _, lo, y, hi, _ in items(first, i)]) for i in range(len(qs))]
+    best = min(range(len(qs)), key=lambda i: abs(covs[i] - metrics.NOMINAL))
+    q = qs[best]
+    print(f"chosen on the first half ({len(first)} tasks): p{q:g}-p{100 - q:g} "
+          f"(coverage there {100 * covs[best]:.1f}%)")
+    print("judged on the second half, never used for the choice:")
+    print(score_line("p10-p90 (today)", items(second, qs.index(10))))
+    print(score_line(f"p{q:g}-p{100 - q:g} (recalibrated)", items(second, best)))
+    print("Interval score uses alpha 0.2 for both, the target being 80%. Turns are whole numbers, so")
+    print("coverage moves in steps: an exact 80% may not exist.")
+
+
+STEPS = {"1": step1, "3": step3}
 
 
 def main(argv: list[str]) -> None:
