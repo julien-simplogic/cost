@@ -465,7 +465,7 @@ and what you can act on; anything that is merely reassuring stays in
 `tokentrail check`.
 
 ```
-ctx 43% | 5h 24% | 7d 41% | cache 3m left | $17.44 at API rates
+ctx 43% | 5h 24% | 7d 41% | cache 3m left | turn 12, est. 9 more (p87.5: 41) | $17.44 at API rates
 ```
 
 - `ctx`: context used.
@@ -476,6 +476,12 @@ ctx 43% | 5h 24% | 7d 41% | cache 3m left | $17.44 at API rates
 - `cache 3m left`: time before the cache written by the last call expires
   (5 minutes or 1 hour, read from that call), as of the last refresh of the
   line. Computed, not estimated.
+- `turn 12, est. 9 more (p87.5: 41)`: once the running task has made 5
+  main-thread turns, how many more turns past tasks that got that far went
+  on to make (median and high bound, from the local database). This one is an
+  estimate. On the author's history, tasks that have run longer have more
+  ahead (median 4 after 1 turn, 11 after 10), and from 5 turns on the
+  backtest held 81-89% of outcomes.
 - `$… at API rates`: the session valued at API prices. On a subscription this
   is not what you pay; it is a common unit for comparing sessions.
 

@@ -21,7 +21,7 @@ from typing import Any, Optional
 from . import estimate, paths, predictions, prices
 from .collectors import claude_code
 from .errors import TokentrailError
-from .analysis import TTL_SECONDS, parse_ts
+from .analysis import INTERVAL, TTL_SECONDS, parse_ts, percentile_sorted
 from .record import totals_match
 from .ingest import ingest_claude_code
 from .report import fmt_cost, fmt_tokens
@@ -89,6 +89,10 @@ def statusline(raw_stdin: str, now: Optional[datetime] = None) -> str:
     if expiry and expiry["warm"] and cc_warm is not False:
         parts.append(f"cache {_left(expiry['left_s'])} left")
 
+    ahead = turns_ahead(main)
+    if ahead:
+        parts.append(f"turn {ahead['k']}, est. {ahead['p50']:.0f} more (p{ahead['q']:g}: {ahead['hi']:.0f})")
+
     cost, unpriced = 0.0, 0
     for r in res.records:
         c = table.cost(r.model, new=r.input_new, cache_read=r.input_cache_read,
@@ -125,6 +129,43 @@ def statusline(raw_stdin: str, now: Optional[datetime] = None) -> str:
     if unpriced:
         alerts.append(f"{unpriced} calls unpriced: model missing from the price file")
     return " | ".join(parts + [f"! {a}" for a in alerts])
+
+
+MIN_K = 5  # from here the remaining-turns estimate held 81-89% in the study's backtest
+MIN_REACHED = 30
+
+
+def turns_ahead(main: list) -> Optional[dict]:
+    """Once the running task has made k main-thread turns, how many more past tasks that
+    reached k went on to make: median and high bound. Read from the local database
+    (read-only), so it reflects whatever `tokentrail ingest` last stored."""
+    if not main:
+        return None
+    task = main[-1].task_id
+    if task.endswith(":untracked"):
+        return None
+    k = sum(1 for r in main if r.task_id == task)
+    if k < MIN_K:
+        return None
+    db = paths.db_path()
+    if not db.is_file():
+        return None
+    import sqlite3
+
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        counts = [n for (t, n) in con.execute(
+            "SELECT task_id, COUNT(*) FROM records WHERE trigger != 'subagent' "
+            "AND task_id NOT LIKE '%:untracked' GROUP BY source, task_id") if t != task]
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        con.close()
+    rest = sorted(n - k for n in counts if n >= k)
+    if len(rest) < MIN_REACHED:
+        return None
+    return {"k": k, "n": len(rest), "p50": percentile_sorted(rest, 50),
+            "hi": percentile_sorted(rest, INTERVAL[1]), "q": INTERVAL[1]}
 
 
 def cache_clock(main: list, table, now: Optional[datetime] = None) -> Optional[dict]:

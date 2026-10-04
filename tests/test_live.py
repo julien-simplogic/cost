@@ -197,3 +197,31 @@ def test_statusline_after_idle_states_the_rewrite_cost(env):
     line = live.statusline(json.dumps({"transcript_path": str(tp), "prompt_cache": {"warm": True}}),
                            now=s.now + timedelta(minutes=48))
     assert "expired" not in line
+
+
+def test_statusline_estimates_turns_ahead_once_a_task_has_run_a_while(env):
+    from datetime import timedelta
+    from tokentrail import live
+
+    hist = FakeSession(env.projects)
+    for n in [6, 7, 8, 9, 10, 12, 15, 20] * 5:  # 40 past tasks
+        hist.prompt("go")
+        for _ in range(n):
+            hist.call(read=10_000, write=100)
+        hist.tick(60)
+    hist.write()
+    main(["ingest"])
+
+    s = FakeSession(env.projects, project="other")
+    s.prompt("long one")
+    for _ in range(4):
+        s.call(read=10_000, write=100)
+    tp = s.write()
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=10))
+    assert "turn " not in line  # under 5 turns: nothing
+    for _ in range(4):
+        s.call(read=10_000, write=100)
+    tp = s.write()
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=10))
+    # 8 turns done; tasks that reached 8: 8,9,10,12,15,20 (x5) -> 0,1,2,4,7,12 more
+    assert "| turn 8, est. 3 more (p87.5: " in line
