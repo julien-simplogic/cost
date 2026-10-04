@@ -10,6 +10,7 @@ Steps (numbering of the 4 Oct 2026 plan):
   4  turns still ahead once a task has made k turns
   5  cost rather than turns: context growth per turn, and which cost estimate does best
   6  candidate signs, one at a time, then a shallow quantile tree if several pass
+     (`6 --q 12.5`: with the p12.5-p87.5 interval step 3 chose)
   8  the ~24k block that survives an expiry: what happens between two expiries when it changes
 """
 
@@ -385,6 +386,13 @@ def step5(tasks: list[T]) -> None:
 # ------------------------------------------------------------------ step 6
 
 MIN_BIN = 30  # a slice with fewer earlier tasks than this falls back to all earlier tasks
+# Interval used by step 6 and its tree: (low, high) percentiles. `--q 12.5` gives p12.5-p87.5,
+# the pair step 3 chose; the target stays 80% either way.
+Q_LO = 10.0
+
+
+def qs3() -> tuple[float, float, float]:
+    return (Q_LO, 50.0, 100.0 - Q_LO)
 BUILTIN_COMMANDS = {"review", "compact", "init", "clear", "security-review", "pr-comments", "model", "cost",
                     "help", "config", "memory", "resume", "context", "loop", "simplify", "code-review"}
 
@@ -409,11 +417,12 @@ def signs(tasks: list[T]) -> dict[str, dict[str, str]]:
     top_projects = {p for p, _ in Counter(t.project for t in tasks).most_common(10)}
     out: dict[str, dict[str, str]] = {k: {} for k in (
         "previous task's turns", "short follow-up", "error pasted", "prompt length", "files mentioned",
-        "slash command", "project", "rank in session", "model")}
+        "slash command", "project", "rank in session", "first of session", "model")}
     for t in tasks:
         p = prev[t.task_id]
         out["previous task's turns"][t.task_id] = "first of session" if p is None else _bucket(
             p.turns, [(1, "1"), (3, "2-3"), (8, "4-8"), (20, "9-20"), (float("inf"), "21+")])
+        out["first of session"][t.task_id] = "first" if rank[t.task_id] == 1 else "later"
         out["rank in session"][t.task_id] = _bucket(
             rank[t.task_id], [(1, "1st"), (3, "2-3"), (10, "4-10"), (30, "11-30"), (float("inf"), "31+")])
         out["project"][t.task_id] = ("project " + anon(t.project)) if t.project in top_projects else "other"
@@ -442,10 +451,10 @@ def sliced_backtest(tasks: list[T], label: dict[str, str]):
     for t in tasks:
         lab = label.get(t.task_id)
         if lab is not None and len(seen_all) >= MIN_HISTORY:
-            base = tuple(percentile_sorted(seen_all, q) for q in (10, 50, 90))
+            base = tuple(percentile_sorted(seen_all, q) for q in qs3())
             h = seen.get(lab, [])
             if len(h) >= MIN_BIN:
-                mine = tuple(percentile_sorted(h, q) for q in (10, 50, 90))
+                mine = tuple(percentile_sorted(h, q) for q in qs3())
             else:
                 mine, fallback = base, fallback + 1
             pairs.append((t, base, mine))
@@ -471,6 +480,7 @@ def passes(pairs) -> bool:
 
 def step6(tasks: list[T]) -> None:
     print("=== Step 6: candidate signs, one at a time (target: main-thread turns of the task)")
+    print(f"Interval: p{Q_LO:g}-p{100 - Q_LO:g} for the baseline and every sign alike; target coverage 80%.")
     print(f"Slices with fewer than {MIN_BIN} earlier tasks fall back to all earlier tasks. Criterion: interval")
     print("score better than the baseline on the same tasks (95% session CI of the difference below 0)")
     print("and coverage between 75% and 85%.")
@@ -513,7 +523,7 @@ def step6(tasks: list[T]) -> None:
 
 def pinball(ys: list[int], preds: tuple[float, float, float]) -> float:
     tot = 0.0
-    for q, p in zip((0.1, 0.5, 0.9), preds):
+    for q, p in zip((x / 100 for x in qs3()), preds):
         for y in ys:
             tot += max(q * (y - p), (q - 1) * (y - p))
     return tot
@@ -521,7 +531,7 @@ def pinball(ys: list[int], preds: tuple[float, float, float]) -> float:
 
 def _quantiles(ys) -> tuple[float, float, float]:
     s = sorted(ys)
-    return tuple(percentile_sorted(s, q) for q in (10, 50, 90))  # type: ignore[return-value]
+    return tuple(percentile_sorted(s, q) for q in qs3())  # type: ignore[return-value]
 
 
 def grow(ts: list[T], labels: dict[str, dict[str, str]], depth: int, path: tuple = ()):
@@ -693,6 +703,11 @@ STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8}
 
 
 def main(argv: list[str]) -> None:
+    global Q_LO
+    if "--q" in argv:
+        i = argv.index("--q")
+        Q_LO = float(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
     wanted = argv or sorted(STEPS)
     tasks = load()
     for s in wanted:

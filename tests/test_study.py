@@ -148,3 +148,13 @@ def test_step8_runs_and_names_no_mcp_server(env, capsys):
     study.step8([])
     out = capsys.readouterr().out
     assert "pairs of consecutive expiries" in out and "clientserver" not in out
+
+
+def test_step6_reruns_with_the_recalibrated_interval(study, capsys):
+    try:
+        study.main(["6", "--q", "12.5"])
+    finally:
+        study.Q_LO = 10.0
+    out = capsys.readouterr().out
+    assert "Interval: p12.5-p87.5 for the baseline and every sign alike" in out
+    assert "-- first of session" in out
