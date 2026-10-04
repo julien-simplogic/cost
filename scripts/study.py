@@ -763,7 +763,7 @@ def neighbours(tasks: list[T], k: int = 30, min_sim: float = 0.1):
     docs = [t for t in tasks if t.prompt and t.prompt.terms]
     df = Counter(w for t in docs for w in t.prompt.terms)
     n = len(docs)
-    common = {w for w, c in df.items() if c > 0.2 * n}  # words in a fifth of all prompts say nothing
+    common = {w for w, c in df.items() if c > 0.05 * n}  # words in 5%+ of prompts say little, and cost time
     idf = {w: math.log(n / c) for w, c in df.items() if w not in common}
     vec = {}
     for t in docs:
