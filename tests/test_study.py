@@ -175,3 +175,10 @@ def test_neighbours_only_look_back(study):
         if near is not None:
             earlier = [x.turns for x in tasks[:tasks.index(t)]]
             assert min(earlier) <= near[0] and near[2] <= max(earlier)
+
+
+def test_step10_runs(study, capsys):
+    study.main(["10", "--q", "12.5"])
+    study.Q_LO = 10.0
+    out = capsys.readouterr().out
+    assert "## 10a." in out and "## 10b." in out and "## 10c." in out

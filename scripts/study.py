@@ -13,6 +13,7 @@ Steps (numbering of the 4 Oct 2026 plan):
      (`6 --q 12.5`: with the p12.5-p87.5 interval step 3 chose)
   8  the ~24k block that survives an expiry: what happens between two expiries when it changes
   9  new levers: more context signs, nearest past prompts, the task's first turns, cost bias
+ 10  combining what passed: a tree on the pre-send signs, shell commands at k = 3/5/10, cost interval
 """
 
 from __future__ import annotations
@@ -918,7 +919,70 @@ def step9(tasks: list[T]) -> None:
     print(f"\nsigns that pass: {', '.join(passed) or 'none'}")
 
 
-STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8, "9": step9}
+# ------------------------------------------------------------------ step 10
+
+
+def neighbour_label(tasks: list[T]) -> dict[str, str]:
+    """The nearest-prompts estimate as a slice: the median turns of the 30 nearest earlier prompts,
+    bucketed, or 'no close prompts'. Leak-free like neighbours()."""
+    out = {}
+    for t, _, near, _ in neighbours(tasks):
+        out[t.task_id] = "no close prompts" if near is None else "close prompts: " + _bucket(
+            near[1], [(2, "median 1-2"), (5, "median 3-5"), (10, "median 6-10"), (float("inf"), "median 11+")])
+    return out
+
+
+def step10(tasks: list[T]) -> None:
+    print(f"=== Step 10: combining what passed (interval p{Q_LO:g}-p{100 - Q_LO:g}, target 80%)")
+    sg, cs = signs(tasks), context_signs(tasks)
+    labels = {
+        "rank in session": sg["rank in session"],
+        "previous task's turns": sg["previous task's turns"],
+        "idle since previous task": cs["idle since previous task"],
+        "previous task edited files": cs["previous task edited files"],
+        "prompt is a question": cs["prompt is a question"],
+        "nearest prompts": neighbour_label(tasks),
+    }
+    print("\n## 10a. pre-send signs that passed, alone and in a shallow tree, on the newest 30%")
+    quantile_tree(tasks, labels)
+
+    print("\n## 10b. while the task runs: shell commands in the first k turns, for k = 3, 5, 10")
+    for k in (3, 5, 10):
+        reached = [t for t in tasks if t.turns >= k]
+        name = f"first {k} turns: shell commands"
+        lab = {}
+        for t in reached:
+            b = _tools(t.rows, k).count("Bash")
+            lab[t.task_id] = "0" if b == 0 else ("1-2" if b <= 2 else ("3-5" if b <= 5 else "6+"))
+        judge_sign(reached, name, lab, target=lambda t, k=k: t.turns - k)
+
+    print("\n## 10c. cost interval: today's, median-corrected, and the earlier ratio's own spread")
+    priced = [t for t in tasks if t.floor > 0 and t.cost > 0]
+    tq = {t.task_id: v for t, v in leak_free(priced, lambda t: t.turns, quantiles=qs3())}
+
+    def raw(t, n):
+        return t.floor + (max(n, 1) - 1) * t.reread
+
+    ratios: list[float] = []
+    today, scaled, spread = [], [], []
+    for t in priced:
+        if t.task_id in tq and len(ratios) >= MIN_HISTORY:
+            lo, mid, hi = (raw(t, n) for n in tq[t.task_id])
+            r_lo, r_mid, r_hi = (percentile_sorted(ratios, q) for q in qs3())
+            today.append((t.key, lo, t.cost, hi, mid))
+            scaled.append((t.key, lo * r_mid, t.cost, hi * r_mid, mid * r_mid))
+            spread.append((t.key, mid * r_lo, t.cost, mid * r_hi, mid * r_mid))
+        if t.task_id in tq:
+            bisect.insort(ratios, t.cost / raw(t, tq[t.task_id][1]))
+    if today:
+        print("   " + score_line("turns x context (today)", today, unit="$"))
+        print("   " + score_line("x median earlier ratio", scaled, unit="$"))
+        print("   " + score_line("median est. x ratio spread", spread, unit="$"))
+        print("   'ratio spread': the estimate at the median number of turns, times the low, median and high")
+        print("   percentiles of actual / estimate over earlier tasks.")
+
+
+STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6, "8": step8, "9": step9, "10": step10}
 
 
 def main(argv: list[str]) -> None:
