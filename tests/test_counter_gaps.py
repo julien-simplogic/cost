@@ -84,7 +84,9 @@ def test_usage_carried_into_the_counter_is_told_apart(env, capsys):
     out = capsys.readouterr().out
     assert "consistent snapshot to snapshot in 1" in out.splitlines()[1]
     assert "COULD NOT VERIFY" not in out
-    assert "counter was +1,000,000 away from this file (usage carried in from outside it)" in out
+    assert "1 sessions differ from the counter in absolute totals only, and are explained" in out
+    m = _explained(capsys)
+    assert m["status"] == "increments_ok" and m["increments"]["offset"] == 1_000_000
 
 
 def test_a_context_qualifier_does_not_split_a_model(env, capsys):
@@ -137,6 +139,13 @@ def test_verified_is_unreachable_with_a_model_on_one_side():
             assert not banner.startswith("Verified"), ck
 
 
+def _explained(capsys) -> dict:
+    """The one session's comparison details, as `report --json` gives them."""
+    main(["report", "--since", "all", "--json", "--no-ingest"])
+    [m] = json.loads(capsys.readouterr().out)["checks"]["mismatched"]
+    return m
+
+
 def _snapshots(env, counter_shortfall):
     """Five turns, a counter snapshot after each; counter_shortfall(turn) = tokens the counter has extra."""
     s = FakeSession(env.projects)
@@ -155,7 +164,8 @@ def test_a_gap_that_appears_once_is_a_hidden_call(env, capsys):
     main(["report", "--since", "all"])
     out = capsys.readouterr().out
     assert "consistent snapshot to snapshot in 1" in out.splitlines()[1]
-    assert "gap moved in 1 of 4 intervals (hidden calls)" in out
+    m = _explained(capsys)
+    assert (m["shape"]["kind"], m["shape"]["steps"], m["shape"]["intervals"]) == ("concentrated", 1, 4)
 
 
 def test_a_gap_that_grows_at_every_snapshot_is_a_counting_error(env, capsys):
@@ -237,7 +247,8 @@ def test_a_counter_that_goes_down_is_reported_as_a_restart(env, capsys):
     out = capsys.readouterr().out
     # the second counter equals exactly the call of the resumed run: restart proven
     assert "exact on the last run in 1" in out.splitlines()[1]
-    assert "counter went DOWN 1 time(s): Claude Code restarted counting" in out
+    m = _explained(capsys)
+    assert m["counter_resets"] == 1 and m["status"] == "run_exact"
     assert main(["diagnose", s.session_id[:8]]) == 0
     d = capsys.readouterr().out
     assert "<- counter went DOWN: Claude Code restarted counting" in d and "counter restarts: 1" in d
@@ -321,7 +332,8 @@ def test_a_restarted_run_that_matches_exactly_counts_as_exact_on_that_run(env, c
     out = capsys.readouterr().out
     assert "exact on the last run in 1" in out.splitlines()[1]
     assert "a single snapshot that disagrees" not in out.splitlines()[1]
-    assert "the counter equals EXACTLY the last 1 of 3 calls" in out
+    m = _explained(capsys)
+    assert (m["last_calls"]["calls"], m["last_calls"]["of"]) == (1, 3)
     main(["check"])
     row = [l for l in capsys.readouterr().out.splitlines() if l.startswith("2.1.288")][-1].split()
     assert row[:4] == ["2.1.288", "1", "0", "1"]  # sessions, exact, exact on last run

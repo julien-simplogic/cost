@@ -553,9 +553,15 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
             )
         else:
             out.append("    No session lets both sides cover the same calls: how much the call lines miss is unknown.")
-        if ck["mismatched"]:
-            out.append("    sessions that disagree, largest first (input + cache, ours minus counter; + = we count more):")
-            for m in ck["mismatched"][:15]:
+        explained = [m for m in ck["mismatched"] if m["status"] in ("lines_exact", "run_exact", "increments_ok")]
+        unresolved = [m for m in ck["mismatched"] if m not in explained]
+        if explained:
+            out.append(f"    {len(explained)} sessions differ from the counter in absolute totals only, and are explained "
+                       "above (exact on the last run, every line exact, or consistent between snapshots); "
+                       "`tokentrail report --json` lists them.")
+        if unresolved:
+            out.append("    sessions not resolved, largest first (input + cache, ours minus counter; + = we count more):")
+            for m in unresolved[:15]:
                 pct = _fmt_pct(m["input_gap_pct"])
                 extra = []
                 inc, sh = m["increments"], m["shape"]
@@ -596,8 +602,8 @@ def _render_trust(rep: dict[str, Any]) -> list[str]:
                     f"      {m['session']} ({m['project']}, {m['version']}): input {m['input_gap']:+,} ({pct}), "
                     f"output {m['output_gap']:+,}" + (f"; {'; '.join(extra)}" if extra else "")
                 )
-            if len(ck["mismatched"]) > 15:
-                out.append(f"      ... and {len(ck['mismatched']) - 15} more (`tokentrail report --json` lists all)")
+            if len(unresolved) > 15:
+                out.append(f"      ... and {len(unresolved) - 15} more (`tokentrail report --json` lists all)")
     else:
         out.append("  No session in this period carries Claude Code's own counter: totals are unchecked.")
     if t["unpriced_turns"]:
