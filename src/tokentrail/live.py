@@ -131,20 +131,28 @@ def statusline(raw_stdin: str, now: Optional[datetime] = None) -> str:
     return " | ".join(parts + [f"! {a}" for a in alerts])
 
 
-MIN_K = 5  # from here the remaining-turns estimate held 81-89% in the study's backtest
+MIN_K = 3  # from here the remaining-turns estimate held 81-89% in the study's backtest
+SHELL_K = 3  # at exactly 3 turns, the shell commands those turns ran also count (study step 10b)
 MIN_REACHED = 30
+
+
+def _shell_slice(n: int) -> str:
+    return "0" if n == 0 else ("1-2" if n <= 2 else ("3-5" if n <= 5 else "6+"))
 
 
 def turns_ahead(main: list) -> Optional[dict]:
     """Once the running task has made k main-thread turns, how many more past tasks that
-    reached k went on to make: median and high bound. Read from the local database
-    (read-only), so it reflects whatever `tokentrail ingest` last stored."""
+    reached k went on to make: median and high bound. At k = 3, only past tasks whose first
+    3 turns ran as many shell commands (0, 1-2, 3-5, 6+): on real history that sign cut the
+    interval score by 3.6 (session CI -5.7 to -1.9) at 80% coverage; at 5 and 10 turns it did
+    not help. Read from the local database (read-only), as of the last `tokentrail ingest`."""
     if not main:
         return None
     task = main[-1].task_id
     if task.endswith(":untracked"):
         return None
-    k = sum(1 for r in main if r.task_id == task)
+    mine = [r for r in main if r.task_id == task]
+    k = len(mine)
     if k < MIN_K:
         return None
     db = paths.db_path()
@@ -154,18 +162,36 @@ def turns_ahead(main: list) -> Optional[dict]:
 
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     try:
-        counts = [n for (t, n) in con.execute(
+        counts = {t: n for (t, n) in con.execute(
             "SELECT task_id, COUNT(*) FROM records WHERE trigger != 'subagent' "
-            "AND task_id NOT LIKE '%:untracked' GROUP BY source, task_id") if t != task]
+            "AND task_id NOT LIKE '%:untracked' GROUP BY source, task_id") if t != task}
+        shell = None
+        if k == SHELL_K:
+            shell = {}
+            for t, extra in con.execute(
+                    "SELECT task_id, extra FROM records WHERE trigger != 'subagent' "
+                    "AND task_id NOT LIKE '%:untracked' ORDER BY ts, rowid"):
+                if t == task or counts.get(t, 0) < k:
+                    continue
+                seen = shell.setdefault(t, [0, 0])
+                if seen[0] < SHELL_K:
+                    seen[0] += 1
+                    seen[1] += (json.loads(extra or "{}").get("tools") or []).count("Bash")
     except sqlite3.DatabaseError:
         return None
     finally:
         con.close()
-    rest = sorted(n - k for n in counts if n >= k)
+    basis = "all"
+    rest = sorted(n - k for n in counts.values() if n >= k)
+    if shell is not None:
+        here = _shell_slice(sum((r.extra.get("tools") or []).count("Bash") for r in mine[:SHELL_K]))
+        sliced = sorted(counts[t] - k for t, (_, b) in shell.items() if _shell_slice(b) == here)
+        if len(sliced) >= MIN_REACHED:
+            rest, basis = sliced, f"{here} shell"
     if len(rest) < MIN_REACHED:
         return None
     return {"k": k, "n": len(rest), "p50": percentile_sorted(rest, 50),
-            "hi": percentile_sorted(rest, INTERVAL[1]), "q": INTERVAL[1]}
+            "hi": percentile_sorted(rest, INTERVAL[1]), "q": INTERVAL[1], "basis": basis}
 
 
 def cache_clock(main: list, table, now: Optional[datetime] = None) -> Optional[dict]:

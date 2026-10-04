@@ -214,14 +214,45 @@ def test_statusline_estimates_turns_ahead_once_a_task_has_run_a_while(env):
 
     s = FakeSession(env.projects, project="other")
     s.prompt("long one")
-    for _ in range(4):
+    for _ in range(2):
         s.call(read=10_000, write=100)
     tp = s.write()
     line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=10))
-    assert "turn " not in line  # under 5 turns: nothing
-    for _ in range(4):
+    assert "turn " not in line  # under 3 turns: nothing
+    for _ in range(6):
         s.call(read=10_000, write=100)
     tp = s.write()
     line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=10))
     # 8 turns done; tasks that reached 8: 8,9,10,12,15,20 (x5) -> 0,1,2,4,7,12 more
     assert "| turn 8, est. 3 more (p87.5: " in line
+
+
+def test_statusline_at_three_turns_counts_the_shell_commands_they_ran(env):
+    from datetime import timedelta
+    from tokentrail import live
+
+    hist = FakeSession(env.projects)
+    for i in range(70):  # 35 tasks that ran 3 shell commands early and went long, 35 that did not
+        busy = i % 2 == 0
+        hist.prompt("go")
+        for j in range(30 if busy else 4):
+            hist.call(read=10_000, write=100, tools=bash("make") if busy and j < 3 else ())
+        hist.tick(60)
+    hist.write()
+    main(["ingest"])
+
+    s = FakeSession(env.projects, project="other")
+    s.prompt("build it")
+    for _ in range(3):
+        s.call(read=10_000, write=100, tools=bash("make"))
+    tp = s.write()
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=10))
+    assert "| turn 3, est. 27 more (" in line  # only the 35 long tasks: 30 - 3
+
+    q = FakeSession(env.projects, project="quiet")
+    q.prompt("look")
+    for _ in range(3):
+        q.call(read=10_000, write=100)
+    tp = q.write()
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=q.now + timedelta(seconds=10))
+    assert "| turn 3, est. 1 more (" in line  # only the 35 short ones: 4 - 3

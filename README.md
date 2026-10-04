@@ -372,6 +372,15 @@ only, with 95% intervals from resampling sessions):
   tree was not kept. Prompt length, files mentioned, slash command, project
   and model do not help; short follow-ups (19 tasks) and pasted errors (17)
   are too rare to tell.
+- *More signs, and the content of the prompt* (steps 9-10). Each of these
+  beats all earlier tasks over the whole history: idle time since the
+  previous task (-2.3), whether that task edited files (-2.2), the prompt
+  ending in a question mark (-0.9; median 3 turns against 6), and above all
+  the 30 earlier prompts most alike in words (-5.3, coverage 80.6%, width 25
+  to 21 turns), found for 36% of prompts. On the newest 30% alone (1,175
+  tasks, 44 sessions) every one of them, and a depth-3 tree on all of them,
+  lands between 58.4 and 61.6 against 60.5 for all tasks, with intervals that
+  overlap: better than nothing, not proven better than each other.
 - *Cost:* turns × context gives the best interval score of four methods
   ($17.97, against $18.70 for quantiles of the cost itself and $32.46 for
   cost scaled by the first input), with 78.5% coverage, but its median runs
@@ -486,12 +495,16 @@ ctx 43% | 5h 24% | 7d 41% | cache 3m left | turn 12, est. 9 more (p87.5: 41) | $
 - `cache 3m left`: time before the cache written by the last call expires
   (5 minutes or 1 hour, read from that call), as of the last refresh of the
   line. Computed, not estimated.
-- `turn 12, est. 9 more (p87.5: 41)`: once the running task has made 5
+- `turn 12, est. 9 more (p87.5: 41)`: once the running task has made 3
   main-thread turns, how many more turns past tasks that got that far went
   on to make (median and high bound, from the local database). This one is an
-  estimate. On the author's history, tasks that have run longer have more
-  ahead (median 4 after 1 turn, 11 after 10), and from 5 turns on the
-  backtest held 81-89% of outcomes.
+  estimate. At exactly 3 turns it only counts past tasks whose first 3 turns
+  ran as many shell commands (0, 1-2, 3-5, 6+): on the author's history a task
+  with 6+ commands in its first 3 turns had a median 23 turns ahead, one with
+  1-2 a median of 1; that cut the interval score by 3.6 (session CI -5.7 to
+  -1.9) at 80% coverage. At 5 and 10 turns the same sign did not help. Tasks
+  that have run longer have more ahead (median 4 after 1 turn, 11 after 10),
+  and from 3 turns on the backtest held 80-89% of outcomes.
 - `$… at API rates`: the session valued at API prices. On a subscription this
   is not what you pay; it is a common unit for comparing sessions.
 
