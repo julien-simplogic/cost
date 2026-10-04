@@ -440,7 +440,7 @@ and what you can act on; anything that is merely reassuring stays in
 `tokentrail check`.
 
 ```
-ctx 43% | 5h 24% | 7d 41% | $17.44 at API rates
+ctx 43% | 5h 24% | 7d 41% | cache 3m left | $17.44 at API rates
 ```
 
 - `ctx`: context used.
@@ -448,14 +448,23 @@ ctx 43% | 5h 24% | 7d 41% | $17.44 at API rates
   used. These are Claude Code's own figures, documented as `rate_limits`, and
   only Pro and Max subscribers get them; tokentrail does not know your limits
   and shows nothing when Claude Code doesn't pass them.
+- `cache 3m left`: time before the cache written by the last call expires
+  (5 minutes or 1 hour, read from that call), as of the last refresh of the
+  line. Computed, not estimated.
 - `$… at API rates`: the session valued at API prices. On a subscription this
   is not what you pay; it is a common unit for comparing sessions.
 
 Problems appear only when there are some:
 
 ```
-ctx 43% | $17.44 at API rates | ! cache cold: next message re-caches 431k | ! 2 cache misses (last: tools_changed)
+ctx 43% | $17.44 at API rates | ! cache expired: next message re-writes up to 431k, $2.16
+ctx 43% | $17.44 at API rates | ! cache cold: next message re-caches 431k, $2.16 | ! 2 cache misses (last: tools_changed)
 ```
+
+After an idle spell the line says what re-writing the context will cost: the
+last call's input and answer at the cache-write price, "up to" because part of
+the prompt can survive (see `score`). Claude Code's own `prompt_cache`
+diagnostics, when present, take precedence.
 
 The cache alerts use Claude Code's own `prompt_cache` diagnostics when they are
 present; on older versions tokentrail spots a miss itself. The other alerts are

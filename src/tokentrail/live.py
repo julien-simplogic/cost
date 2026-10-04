@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from . import estimate, paths, predictions, prices
 from .collectors import claude_code
 from .errors import TokentrailError
+from .analysis import TTL_SECONDS, parse_ts
 from .record import totals_match
 from .ingest import ingest_claude_code
 from .report import fmt_cost, fmt_tokens
@@ -43,7 +45,7 @@ def _read_stdin_json(raw: str) -> dict[str, Any]:
 # ------------------------------------------------------------------ status line
 
 
-def statusline(raw_stdin: str) -> str:
+def statusline(raw_stdin: str, now: Optional[datetime] = None) -> str:
     """One line: what changes and what you can act on. Problems only when there are some.
 
     Always: context used, your plan's usage windows when Claude Code passes them
@@ -79,6 +81,14 @@ def statusline(raw_stdin: str) -> str:
         if isinstance(used, (int, float)):
             parts.append(f"{label} {used:.0f}%")
 
+    # Cache: computed from the last call's time and the TTL it was written with, nothing estimated.
+    # Claude Code's own prompt_cache diagnostics, when present, win over this.
+    cache = _obj(data, "prompt_cache")
+    expiry = cache_clock(main, table, now)
+    cc_warm = cache.get("warm") if cache else None
+    if expiry and expiry["warm"] and cc_warm is not False:
+        parts.append(f"cache {_left(expiry['left_s'])} left")
+
     cost, unpriced = 0.0, 0
     for r in res.records:
         c = table.cost(r.model, new=r.input_new, cache_read=r.input_cache_read,
@@ -91,10 +101,13 @@ def statusline(raw_stdin: str) -> str:
     parts.append(f"{fmt_cost(cost)} at API rates")
 
     alerts = []
-    cache = _obj(data, "prompt_cache")
+    if cc_warm is False and isinstance(cache.get("recache_tokens_if_cold"), int):
+        n = cache["recache_tokens_if_cold"]
+        alerts.append(f"cache cold: next message re-caches {fmt_tokens(n)}" + _write_cost(last, table, n, expiry))
+    elif expiry and not expiry["warm"] and cc_warm is not True:
+        alerts.append(f"cache expired: next message re-writes up to {fmt_tokens(expiry['tokens'])}"
+                      + _write_cost(last, table, expiry["tokens"], expiry))
     if cache:
-        if cache.get("warm") is False and isinstance(cache.get("recache_tokens_if_cold"), int):
-            alerts.append(f"cache cold: next message re-caches {fmt_tokens(cache['recache_tokens_if_cold'])}")
         misses = cache.get("misses")
         if isinstance(misses, int) and misses > 0:
             causes = _obj(cache, "last_miss_cause").get("causes")
@@ -112,6 +125,42 @@ def statusline(raw_stdin: str) -> str:
     if unpriced:
         alerts.append(f"{unpriced} calls unpriced: model missing from the price file")
     return " | ".join(parts + [f"! {a}" for a in alerts])
+
+
+def cache_clock(main: list, table, now: Optional[datetime] = None) -> Optional[dict]:
+    """Time left on the main thread's cache, or that it has expired, and what the next call
+    would write: the last call's input plus its answer (your next text not included)."""
+    if not main:
+        return None
+    last = main[-1]
+    ttl = "5m"
+    for r in reversed(main):
+        if r.input_cache_write:
+            ttl = "1h" if r.input_cache_write_1h else "5m"
+            break
+    t = parse_ts(last.timestamp)
+    if t is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    left = TTL_SECONDS[ttl] - (now - t).total_seconds()
+    return {"ttl": ttl, "warm": left > 0, "left_s": max(left, 0.0),
+            "tokens": last.input_total + last.output_total}
+
+
+def _write_cost(last, table, tokens: int, expiry: Optional[dict]) -> str:
+    p = table.lookup(last.model)
+    if not p:
+        return ""
+    mult = table.write_1h if expiry and expiry["ttl"] == "1h" else table.write_5m
+    return f", {fmt_cost(tokens * p.input * mult / 1e6)}"
+
+
+def _left(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.0f}h"
 
 
 def _obj(d: Any, key: str) -> dict:

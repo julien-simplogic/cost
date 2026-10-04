@@ -165,3 +165,35 @@ def _runs_tokentrail(command: str, args: str) -> bool:
 
     exe, _, rest = command.rpartition(" " + args.split()[0])
     return rest == args[len(args.split()[0]):] and PureWindowsPath(exe.strip('"')).stem.lower() == "tokentrail"
+
+
+def _clock_session(env):
+    s = FakeSession(env.projects)
+    s.prompt("x")
+    s.call(new=2, write=100_000, out=0)
+    s.call(read=100_000, write=4_000, out=1_000)  # last call: 104,000 in, 1,000 out, 5m TTL
+    return s.write(), s
+
+
+def test_statusline_counts_down_the_cache(env):
+    from datetime import timedelta
+    from tokentrail import live
+
+    tp, s = _clock_session(env)
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(seconds=100))
+    assert "| cache 3m left |" in line and "!" not in line
+
+
+def test_statusline_after_idle_states_the_rewrite_cost(env):
+    from datetime import timedelta
+    from tokentrail import live
+
+    tp, s = _clock_session(env)
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=s.now + timedelta(minutes=48))
+    # 104,000 + 1,000 written at 1.25 x $4/MTok (opus 5.5): computed, nothing estimated
+    assert f"! cache expired: next message re-writes up to 105k, ${105_000 * 4 * 1.25 / 1e6:.3f}" in line
+    assert "cache 0" not in line and " left" not in line
+    # Claude Code's own diagnostics win: it says warm, so no expiry is claimed
+    line = live.statusline(json.dumps({"transcript_path": str(tp), "prompt_cache": {"warm": True}}),
+                           now=s.now + timedelta(minutes=48))
+    assert "expired" not in line
