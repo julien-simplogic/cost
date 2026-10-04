@@ -296,6 +296,11 @@ Three kinds of numbers, never mixed:
   1 h) and the model. After a long pause the first line reads, for example:
   `Idle for 48 min: the 5m cache has expired. Your next message re-writes the
   whole context, 91,915 tokens, $0.460 ($0.437 more than with a warm cache).`
+  `tokentrail score` backtests this on your history. On the author's: the
+  next-call input was within 5% in 3,659 of 3,724 prompts (median error
+  0.0%), and "warm" held in 3,264 of 3,279. "Cold" held in only 351 of 445:
+  in the other 94, 10% or more of the context was still read from cache. Why
+  is not established yet, so "cold" is less certain than "warm".
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes

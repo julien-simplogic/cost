@@ -231,8 +231,12 @@ def backtest_computed(rows, task_stats: list[TaskStats], tasks: dict) -> dict[st
             main_by_session.setdefault(r.session_key, []).append(r)
     first_of_task = {(t.session_key, t.task_id) for t in task_stats if t.tracked}
     errors, cold, warm = [], [], []
+    cold_cases: list[tuple[str, float, float, str]] = []  # (why, read share, gap s, ttl)
     for key, main in main_by_session.items():
+        ttl = "5m"
         for prev, cur in zip(main, main[1:]):
+            if prev.cache_write:  # the TTL in force is the one of the last write, as estimate reads it
+                ttl = "1h" if prev.cache_write_1h else "5m"
             if cur.trigger != "user_turn" or (key, cur.task_id) not in first_of_task or prev.task_id == cur.task_id:
                 continue
             if cur.extra.get("after_compaction") or cur.input_total < 0.5 * prev.input_total or not prev.input_total:
@@ -244,14 +248,15 @@ def backtest_computed(rows, task_stats: list[TaskStats], tasks: dict) -> dict[st
             prompt_chars = int((tasks.get((cur.source, cur.task_id)) or {}).get("prompt_chars") or 0)
             predicted = prev.input_total + prev.output + round(prompt_chars / ratio)
             errors.append((cur.input_total - predicted) / cur.input_total)
-            ttl = "1h" if prev.cache_write_1h else "5m"
             if prev.input_total < 4096:
                 continue
             share = cur.cache_read / prev.input_total
             if cur.model != prev.model or gap > TTL_SECONDS[ttl]:
                 cold.append(share)
+                cold_cases.append(("model" if cur.model != prev.model else "idle", share, gap, ttl))
             else:
                 warm.append(share)
+    missed = [c for c in cold_cases if c[1] >= 0.1]
     return {
         "prompts": len(errors),
         "input_median_error": percentile(errors, 50),
@@ -261,6 +266,21 @@ def backtest_computed(rows, task_stats: list[TaskStats], tasks: dict) -> dict[st
         "cold_said": len(cold),
         "cold_was_cold": sum(1 for s in cold if s < 0.1),
         "cold_median_read_share": percentile(cold, 50),
+        "cold_read_share_p90": percentile(cold, 90),
+        # the "said cold" cases that were not: what they have in common
+        "cold_missed": {
+            "n": len(missed),
+            "model_switch": sum(1 for c in missed if c[0] == "model"),
+            "idle_5m": sum(1 for c in missed if c[0] == "idle" and c[3] == "5m"),
+            "idle_1h": sum(1 for c in missed if c[0] == "idle" and c[3] == "1h"),
+            "fully_warm": sum(1 for c in missed if c[1] >= 0.9),
+            "read_share_p50": percentile([c[1] for c in missed], 50),
+            "idle_gap_p10_s": percentile([c[2] for c in missed if c[0] == "idle"], 10),
+            "idle_gap_p50_s": percentile([c[2] for c in missed if c[0] == "idle"], 50),
+            "idle_gap_p90_s": percentile([c[2] for c in missed if c[0] == "idle"], 90),
+            "idle_5m_gap_under_1h": sum(1 for c in missed if c[0] == "idle" and c[3] == "5m" and c[2] <= 3600),
+        },
+        "cold_cut_read_share_p50": percentile([c[1] for c in cold_cases if c[1] < 0.1], 50),
         "warm_said": len(warm),
         "warm_was_warm": sum(1 for s in warm if s >= 0.9),
         "warm_median_read_share": percentile(warm, 50),
@@ -395,6 +415,14 @@ def render_score(rep: dict[str, Any]) -> str:
                    f"p90 {_pct(c['input_p90_error'])}), within 5%: {_of(c['input_within_5pct'], c['prompts'])}")
         out.append(f"  said cold (idle past the TTL or model switch): {_of(c['cold_was_cold'], c['cold_said'])} "
                    f"read under 10% of the context from cache (median {_share(c['cold_median_read_share'])})")
+        m = c["cold_missed"]
+        if m["n"]:
+            out.append(f"    the {m['n']} that read 10% or more: {m['model_switch']} after a model switch, "
+                       f"{m['idle_5m']} idle past a 5m TTL ({m['idle_5m_gap_under_1h']} of them within an hour), "
+                       f"{m['idle_1h']} idle past a 1h TTL")
+            out.append(f"    they read a median {_share(m['read_share_p50'])} of the context from cache, "
+                       f"{m['fully_warm']} read 90% or more; idle time p10 {_dur(m['idle_gap_p10_s'])}, "
+                       f"median {_dur(m['idle_gap_p50_s'])}, p90 {_dur(m['idle_gap_p90_s'])}")
         out.append(f"  said warm: {_of(c['warm_was_warm'], c['warm_said'])} read 90% or more "
                    f"(median {_share(c['warm_median_read_share'])})")
     else:
@@ -427,6 +455,12 @@ def _num(x: Optional[float], digits: int = 1) -> str:
 
 def _pct(x: Optional[float]) -> str:
     return "?" if x is None else f"{100 * x:+.1f}%"
+
+
+def _dur(x: Optional[float]) -> str:
+    if x is None:
+        return "?"
+    return f"{x / 60:.0f} min" if x < 7200 else f"{x / 3600:.1f} h"
 
 
 def _share(x: Optional[float]) -> str:

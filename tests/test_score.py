@@ -121,6 +121,24 @@ def test_computed_part_backtest_on_history(env, store):
     assert sc["prompts"] == 2
     assert sc["warm_said"] == 1 and sc["warm_was_warm"] == 1
     assert sc["cold_said"] == 1 and sc["cold_was_cold"] == 1
+    assert sc["cold_missed"]["n"] == 0
+
+
+def test_backtest_says_what_the_wrongly_cold_cases_have_in_common(env, store):
+    s = FakeSession(env.projects, start=T0)
+    s.prompt("first")
+    s.call(new=2, write=30_000, out=500)
+    s.tick(400)  # past 5 min, yet the cache held
+    s.prompt("again")
+    s.call(new=2, read=30_000, write=700, out=100)
+    s.write()
+    ingest_claude_code(store, env.projects)
+    sc = predictions.build_score(store, prices.load())["backtest"]["computed"]
+    m = sc["cold_missed"]
+    assert (sc["cold_said"], sc["cold_was_cold"]) == (1, 0)
+    assert (m["n"], m["idle_5m"], m["fully_warm"], m["idle_5m_gap_under_1h"]) == (1, 1, 1, 1)
+    text = predictions.render_score(predictions.build_score(store, prices.load()))
+    assert "the 1 that read 10% or more: 0 after a model switch, 1 idle past a 5m TTL" in text
 
 
 def test_turn_distribution_by_family_flags_spread(env, store, capsys):
