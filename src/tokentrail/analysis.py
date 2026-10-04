@@ -154,6 +154,76 @@ def cache_events(main_rows: Sequence[Row], prices: PriceTable) -> list[CacheEven
     return events
 
 
+@dataclass
+class Expiry:
+    """A main-thread call made after the cache TTL ran out, same model as the call before."""
+
+    session_key: str
+    model: str
+    ts: str
+    gap_s: float
+    ttl: str
+    context: int  # the previous call's input: what would have been cached
+    read: int  # what was read from cache anyway
+
+
+def expiries(rows: Iterable[Row]) -> list[Expiry]:
+    """Every call after an idle expiry, across sessions. Compaction and model switches are left out."""
+    by: dict[str, list[Row]] = {}
+    for r in rows:
+        if r.trigger != "subagent":
+            by.setdefault(r.session_key, []).append(r)
+    out = []
+    for key, main in by.items():
+        ttl = "5m"
+        for prev, cur in zip(main, main[1:]):
+            if prev.cache_write:
+                ttl = "1h" if prev.cache_write_1h else "5m"
+            if prev.input_total < MIN_CACHEABLE or cur.model != prev.model or cur.extra.get("after_compaction"):
+                continue
+            if cur.input_total < 0.5 * prev.input_total:
+                continue
+            t0, t1 = parse_ts(prev.ts), parse_ts(cur.ts)
+            if not (t0 and t1):
+                continue
+            gap = (t1 - t0).total_seconds()
+            if gap > TTL_SECONDS[ttl]:
+                out.append(Expiry(key, cur.model, cur.ts, gap, ttl, prev.input_total, cur.cache_read))
+    return out
+
+
+def other_session_active(rows: Iterable[Row], cases: Sequence[Expiry]) -> list[bool]:
+    """For each expiry: did another session call the same model within the TTL before it?
+
+    If so, that session may have kept warm a prompt prefix both share (system
+    prompt, tools), which would explain cache reads after an expiry.
+    """
+    import bisect
+
+    by_model: dict[str, list[tuple[datetime, str]]] = {}
+    for r in rows:
+        t = parse_ts(r.ts)
+        if t:
+            by_model.setdefault(r.model, []).append((t, r.session_key))
+    for v in by_model.values():
+        v.sort()
+    out = []
+    for c in cases:
+        calls = by_model.get(c.model, [])
+        t = parse_ts(c.ts)
+        found = False
+        if t:
+            i = bisect.bisect_left(calls, (t, ""))
+            lo = t - timedelta(seconds=TTL_SECONDS[c.ttl])
+            while i > 0 and calls[i - 1][0] >= lo:
+                i -= 1
+                if calls[i][1] != c.session_key:
+                    found = True
+                    break
+        out.append(found)
+    return out
+
+
 def is_prefix_file(path: str) -> bool:
     p = path.replace("\\", "/")
     return p.rsplit("/", 1)[-1] in PREFIX_FILES or "/.claude/" in f"/{p}"

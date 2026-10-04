@@ -189,3 +189,28 @@ def test_cli_score_runs_and_estimate_records(env, capsys):
     assert "Recorded estimates: 1 (cli 1)" in out
     assert "No estimate scored yet" in out
     assert "Backtest on your history" in out
+
+
+def test_after_an_expiry_what_survives_is_measured_and_tied_to_other_sessions(env, store):
+    # two sessions in parallel; session A goes idle for 2 h while B keeps working
+    a = FakeSession(env.projects, project="alpha", start=T0)
+    b = FakeSession(env.projects, project="beta", start=T0)
+    for _ in range(12):
+        a.prompt("go")
+        a.call(new=2, read=8_000, write=42_000)
+        a.tick(7200)  # 2 h idle: the 5m cache is long gone...
+        a.prompt("back")
+        a.call(new=2, read=8_000, write=42_100)  # ...yet 8k of shared prefix was read
+    for _ in range(12 * 37):
+        b.call(new=2, read=8_000, write=50)
+        b.tick(200)  # b never lets its own cache expire
+    a.write(), b.write()
+    ingest_claude_code(store, env.projects)
+    e = predictions.build_score(store, prices.load())["backtest"]["computed"]["expiry"]
+    assert e["n"] == 12 and e["read_p50"] == 8_000
+    assert e["other_active"] == 12 and e["other_active_read10"] == 12 and e["alone"] == 0
+
+    est = estimate.build(store, prices.load(), estimate.EstimateInput(
+        session=a.session_id[:8], now=a.now + timedelta(hours=3)))
+    assert est["certain"][0].startswith("Idle for 3.0 h")
+    assert "a median 8,000 tokens were still read from cache anyway" in est["certain"][1]

@@ -143,12 +143,12 @@ def test_idle_time_is_stated_first_with_tokens_and_dollars(env, store):
     s = _current(env.projects)
     est = _est(store, s, text="x" * 250, now=s.now + timedelta(minutes=48))
     assert est["computed"]["cached"] == 0
-    [line] = est["certain"]
+    line = est["certain"][0]
     # 60,000 + 700 + 100 written at 1.25 x $4/MTok; warm it would be 60,000 read at $0.20 + 800 written
     full = 60_800 * 4 * 1.25 / 1e6
     warm = (60_000 * 0.20 + 800 * 4 * 1.25) / 1e6
     assert line.startswith("Idle for 48 min: the 5m cache has expired.")
-    assert "60,800 tokens, $" + f"{full:.3f}" in line
+    assert "up to 60,800 tokens, $" + f"{full:.3f}" in line
     assert f"${full - warm:.3f} more than with a warm cache" in line
     text = estimate.render(est)
     assert text.splitlines()[2] == line  # right after the header, before any detail

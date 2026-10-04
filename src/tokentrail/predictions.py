@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .analysis import (
-    SPREAD_LIMIT, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
+    SPREAD_LIMIT, expiries, other_session_active, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
     percentile_sorted,
 )
 from .classify import FAMILIES
@@ -280,10 +280,31 @@ def backtest_computed(rows, task_stats: list[TaskStats], tasks: dict) -> dict[st
             "idle_gap_p90_s": percentile([c[2] for c in missed if c[0] == "idle"], 90),
             "idle_5m_gap_under_1h": sum(1 for c in missed if c[0] == "idle" and c[3] == "5m" and c[2] <= 3600),
         },
-        "cold_cut_read_share_p50": percentile([c[1] for c in cold_cases if c[1] < 0.1], 50),
+        "expiry": _expiry_stats(rows),
         "warm_said": len(warm),
         "warm_was_warm": sum(1 for s in warm if s >= 0.9),
         "warm_median_read_share": percentile(warm, 50),
+    }
+
+
+def _expiry_stats(rows) -> dict[str, Any]:
+    """After every idle expiry in the history (not only before a prompt): how much
+    was still read from cache, and was another session active just before?"""
+    cases = expiries(rows)
+    active = other_session_active(rows, cases)
+    w = [c for c, a in zip(cases, active) if a]
+    wo = [c for c, a in zip(cases, active) if not a]
+    return {
+        "n": len(cases),
+        "read_p10": percentile([c.read for c in cases], 10),
+        "read_p50": percentile([c.read for c in cases], 50),
+        "read_p90": percentile([c.read for c in cases], 90),
+        "other_active": len(w),
+        "other_active_read10": sum(1 for c in w if c.read >= 0.1 * c.context),
+        "other_active_read_p50": percentile([c.read for c in w], 50),
+        "alone": len(wo),
+        "alone_read10": sum(1 for c in wo if c.read >= 0.1 * c.context),
+        "alone_read_p50": percentile([c.read for c in wo], 50),
     }
 
 
@@ -423,6 +444,15 @@ def render_score(rep: dict[str, Any]) -> str:
             out.append(f"    they read a median {_share(m['read_share_p50'])} of the context from cache, "
                        f"{m['fully_warm']} read 90% or more; idle time p10 {_dur(m['idle_gap_p10_s'])}, "
                        f"median {_dur(m['idle_gap_p50_s'])}, p90 {_dur(m['idle_gap_p90_s'])}")
+        e = c["expiry"]
+        if e["n"]:
+            out.append(f"  after every idle expiry ({e['n']:,} calls): tokens still read from cache p10 "
+                       f"{_tok(e['read_p10'])}, median {_tok(e['read_p50'])}, p90 {_tok(e['read_p90'])}")
+            out.append(f"    another session used the same model within the TTL before: {e['other_active']:,} calls, "
+                       f"{_of(e['other_active_read10'], e['other_active'])} read 10% or more "
+                       f"(median {_tok(e['other_active_read_p50'])} tokens)")
+            out.append(f"    no other session active: {e['alone']:,} calls, {_of(e['alone_read10'], e['alone'])} "
+                       f"read 10% or more (median {_tok(e['alone_read_p50'])} tokens)")
         out.append(f"  said warm: {_of(c['warm_was_warm'], c['warm_said'])} read 90% or more "
                    f"(median {_share(c['warm_median_read_share'])})")
     else:
@@ -455,6 +485,10 @@ def _num(x: Optional[float], digits: int = 1) -> str:
 
 def _pct(x: Optional[float]) -> str:
     return "?" if x is None else f"{100 * x:+.1f}%"
+
+
+def _tok(x: Optional[float]) -> str:
+    return "?" if x is None else f"{round(x):,}"
 
 
 def _dur(x: Optional[float]) -> str:

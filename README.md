@@ -295,12 +295,17 @@ Three kinds of numbers, never mixed:
   cached follows from the idle time, the cache TTL Claude Code used (5 min or
   1 h) and the model. After a long pause the first line reads, for example:
   `Idle for 48 min: the 5m cache has expired. Your next message re-writes the
-  whole context, 91,915 tokens, $0.460 ($0.437 more than with a warm cache).`
+  context, up to 91,915 tokens, $0.460 ($0.437 more than with a warm cache).`
   `tokentrail score` backtests this on your history. On the author's: the
   next-call input was within 5% in 3,659 of 3,724 prompts (median error
-  0.0%), and "warm" held in 3,264 of 3,279. "Cold" held in only 351 of 445:
-  in the other 94, 10% or more of the context was still read from cache. Why
-  is not established yet, so "cold" is less certain than "warm".
+  0.0%), and "warm" held in 3,265 of 3,280. "Cold" held in 351 of 444. In
+  91 of the other 93, the session had been idle past a 1-hour TTL (median
+  3 hours), and a median 15% of the context was still read from cache. So
+  "up to": after an expiry, part of the prompt can survive. When your history
+  has enough expiries, a second line gives what survived after them and the
+  cost that implies. `score` also checks one explanation: whether another
+  session using the same model was active just before (a prompt prefix both
+  share, kept warm by the other).
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
@@ -436,8 +441,8 @@ what is certain (idle time, cache state, what re-writing costs), then the
 unvalidated turn estimate and the warnings:
 
 ```
-tokentrail: Idle for 48 min: the 5m cache has expired. Your next message re-writes the whole
-context, 91,915 tokens, $0.460 ($0.437 more than with a warm cache).
+tokentrail: Idle for 48 min: the 5m cache has expired. Your next message re-writes the
+context, up to 91,915 tokens, $0.460 ($0.437 more than with a warm cache).
   unvalidated estimate: 1-20 turns, median 7 (all 39 past tasks, too few 'question' ones)
   x context = $0.460-$0.805, output and sub-agents not included
 ```

@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .analysis import (
-    TTL_SECONDS, Row, cache_events, distribution, enrich, group_tasks, is_prefix_file,
-    parse_ts, ttl_of,
+    TTL_SECONDS, Row, cache_events, distribution, enrich, expiries, group_tasks, is_prefix_file,
+    parse_ts, percentile, ttl_of,
 )
 from .prices import PriceTable
 from .report import fmt_cost, fmt_tokens
@@ -210,6 +210,15 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
 
     # ------------------------------------------------------------- warnings
     certain = _certain(gap, ttl, warm, model, last, input_next, cached, floor_cost, warm_cost, t_last)
+    if not warm and model == last.model and t_last:
+        # Measured, not assumed: after an expiry, part of the prompt can still come from cache
+        past = [e.read for e in expiries(all_rows) if e.model == model]
+        if len(past) >= MIN_CALIBRATION:
+            kept = min(int(percentile(past, 50) or 0), input_next)
+            if kept:
+                certain.append(
+                    f"After your {len(past)} past expiries on this model, a median {kept:,} tokens were still "
+                    f"read from cache anyway; that would make it {fmt_cost(in_cost(kept, input_next - kept))}.")
     warnings = []
     edited_prefix = [e for e in inp.edits if is_prefix_file(e)]
     if edited_prefix:
@@ -300,8 +309,8 @@ def _certain(gap, ttl, warm, model, last, input_next, cached, floor_cost, warm_c
                    "so whether the cache is still warm is unknown.")
     elif not warm:
         out.append(
-            f"Idle for {_ago(gap)}: the {ttl} cache has expired. Your next message re-writes the whole "
-            f"context, {input_next:,} tokens, {fmt_cost(floor_cost)} "
+            f"Idle for {_ago(gap)}: the {ttl} cache has expired. Your next message re-writes the "
+            f"context, up to {input_next:,} tokens, {fmt_cost(floor_cost)} "
             f"({fmt_cost((floor_cost or 0) - (warm_cost or 0))} more than with a warm cache)."
         )
     else:
