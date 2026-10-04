@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from dataclasses import asdict
 from typing import Any, Optional
 
-from .analysis import Row, cache_events, enrich, group_tasks
+from .analysis import BreakCauses, Row, break_causes, cache_events, enrich, group_tasks
 from .classify import CATEGORIES, CATEGORY_LABELS
 from .prices import PriceTable
 from .record import counter_resets, gap_shape, increments
@@ -657,6 +658,18 @@ def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
         else:
             d[session_status(json.loads(s["coverage"] or "{}"))[0]] += 1
 
+    # Cache breaks: what the transcript shows right before each one
+    main_by: dict[str, list] = defaultdict(list)
+    for r in rows:
+        if r.trigger != "subagent":
+            main_by[r.session_key].append(r)
+    events_by: dict[str, list] = defaultdict(list)
+    for e in store.file_events():
+        events_by[e["session_key"]].append(e)
+    causes = BreakCauses()
+    for key, main in main_by.items():
+        causes.add(break_causes(main, events_by.get(key, []), prices))
+
     months: dict[str, dict[str, float]] = {}
     for r in rows:
         m = months.setdefault(r.ts[:7], defaultdict(float))
@@ -669,6 +682,7 @@ def build_check(store: Store, prices: PriceTable) -> dict[str, Any]:
     return {
         "versions": {k: dict(v) for k, v in sorted(versions.items())},
         "single_version": {k: dict(v) for k, v in sorted(single.items())},
+        "cache_breaks": {**asdict(causes), "break_cost": {k: round(v, 4) for k, v in causes.break_cost.items()}},
         "months": {k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in sorted(months.items())},
     }
 
@@ -698,6 +712,21 @@ def render_check(chk: dict[str, Any]) -> str:
                        "can't check", "unexplained"], rows, {1, 2, 3, 4, 5, 6})
     else:
         out.append("  none: every session with a counter mixes several Claude Code versions")
+    out.append("")
+    b = chk["cache_breaks"]
+    out.append("Cache breaks (cache lost within its TTL), by what the transcript shows just before")
+    if b["breaks"]:
+        rows = [[label, str(b[k]), fmt_cost(b["break_cost"][k])] for k, label in (
+            ("model_switch", "model switch"),
+            ("prefix_file_written", "CLAUDE.md, settings or .claude/ written by a tool"),
+            ("no_visible_cause", "nothing visible"),
+        )]
+        out += _table(["before the break", "breaks", "extra cost"], rows, {1, 2})
+    else:
+        out.append("  none")
+    out.append(f"  Edits of those files by a tool, with a call after them: {b['prefix_writes']}; followed by a")
+    out.append(f"  break on that next call: {b['prefix_writes_then_break']}. Edits made in your own editor, MCP tool")
+    out.append("  changes and Claude Code updates are not in the transcripts: they fall under 'nothing visible'.")
     out.append("")
     out.append("By month (compare with your plan's usage page)")
     rows = [

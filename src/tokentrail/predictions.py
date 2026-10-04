@@ -1,0 +1,438 @@
+"""The estimate scores itself: every estimate is recorded, then compared with what happened.
+
+An estimate is linked to the first task of its session that starts after it
+(within LINK_WINDOW_S). Once that task is over, a later task started in the
+same session or nothing happened in it for FINISHED_AFTER_S, its outcome is
+written next to the estimate and never recomputed: transcripts get cleaned up,
+the record stays.
+
+`tokentrail score` then says, over the last N scored estimates, how often the
+outcome fell inside the interval and how far the median was off. It also
+backtests on the whole history what needs no recorded estimate: the computed
+next-call input, the cache state, and the turn intervals each task would have
+got from the tasks before it.
+
+Only numbers are stored, never the prompt text.
+"""
+
+from __future__ import annotations
+
+import bisect
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from .analysis import (
+    SPREAD_LIMIT, TTL_SECONDS, TaskStats, distribution, enrich, group_tasks, parse_ts, percentile,
+    percentile_sorted,
+)
+from .classify import FAMILIES
+from .prices import PriceTable
+from .report import _table
+from .store import Store
+
+LINK_WINDOW_S = 1800  # an estimate older than this when its session's next task starts is not about it
+FINISHED_AFTER_S = 3600  # a task with no activity for this long is over
+START_SLACK_S = 5  # the hook runs just before the prompt is written: allow a little clock jitter
+MIN_BASIS = 8  # same as estimate.MIN_FAMILY_SAMPLES
+
+
+def record(store: Store, est: dict[str, Any], origin: str) -> int:
+    """Keep what the estimate said. Numbers only."""
+    c, p = est["computed"], est["predicted"]
+    return store.add_prediction(est["made_at"], origin, est["session_key"], {
+        "family": p["family"],
+        "family_source": p["family_source"],
+        "basis_is_family": p["basis_is_family"],
+        "samples": p["samples"],
+        "turns": p["turns"],
+        "cost": p["cost"],
+        "input_next": c["input_next"],
+        "cached": c["cached"],
+        "cache_ttl": c["cache_ttl"],
+        "seconds_since_last_call": c["seconds_since_last_call"],
+        "floor_cost": est["frame"]["floor"]["cost"],
+        "prompt_chars": est.get("prompt_chars", 0),
+        "model": est["model"],
+    })
+
+
+def settle(store: Store, prices: PriceTable, now: Optional[datetime] = None,
+           task_stats: Optional[list[TaskStats]] = None) -> int:
+    """Link open estimates to their task, and record the outcome of finished ones. Returns how many changed."""
+    if not store.has_open_predictions():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    if task_stats is None:
+        tasks = store.tasks()
+        task_stats = group_tasks(enrich(store.records(), prices, tasks), tasks)
+    by_session: dict[str, list[TaskStats]] = {}
+    for t in task_stats:
+        if t.tracked and t.turns_main:
+            by_session.setdefault(t.session_key, []).append(t)
+    for ts in by_session.values():
+        ts.sort(key=lambda t: t.started)
+    stats = {(t.session_key, t.task_id): t for t in task_stats}
+    taken = {(p["session_key"], p["task_id"]) for p in store.predictions() if p["task_id"]}
+    changed = 0
+
+    # newest first: when several estimates precede one task, the latest one is about it
+    for p in sorted(store.predictions("open"), key=lambda p: p["made_at"], reverse=True):
+        made = parse_ts(p["made_at"])
+        if made is None:
+            store.settle_prediction(p["id"], "unmatched")
+            changed += 1
+            continue
+        task = None
+        for t in by_session.get(p["session_key"], []):
+            start = parse_ts(t.started)
+            if start is None:
+                continue
+            dt = (start - made).total_seconds()
+            if dt < -START_SLACK_S:
+                continue
+            if dt <= LINK_WINDOW_S:
+                task = t
+            break
+        if task is not None and (p["session_key"], task.task_id) in taken:
+            store.settle_prediction(p["id"], "superseded")  # a later estimate is about the same task
+            changed += 1
+        elif task is not None:
+            taken.add((p["session_key"], task.task_id))
+            store.settle_prediction(p["id"], "linked", task_id=task.task_id)
+            changed += 1
+        elif (now - made).total_seconds() > LINK_WINDOW_S:
+            store.settle_prediction(p["id"], "unmatched")
+            changed += 1
+
+    for p in store.predictions("linked"):
+        t = stats.get((p["session_key"], p["task_id"]))
+        if t is None:
+            continue
+        if not _finished(t, by_session.get(p["session_key"], []), now):
+            continue
+        store.settle_prediction(p["id"], "scored", outcome={
+            "turns_main": t.turns_main,
+            "turns": t.turns,
+            "cost": round(t.cost, 6),
+            "unpriced_calls": t.unpriced,
+            "first_input": t.first_input,
+            "first_cache_read": t.first_cache_read,
+            "family_after": t.family,
+            "finished_seen_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        changed += 1
+    return changed
+
+
+def _finished(t: TaskStats, same_session: list[TaskStats], now: datetime) -> bool:
+    if any(o.started > t.started for o in same_session):
+        return True
+    last = parse_ts(max(r.ts for r in t.rows))
+    return last is not None and (now - last).total_seconds() > FINISHED_AFTER_S
+
+
+# ------------------------------------------------------------------ score
+
+
+def build_score(store: Store, prices: PriceTable, last: int = 50) -> dict[str, Any]:
+    tasks = store.tasks()
+    rows = enrich(store.records(), prices, tasks)
+    task_stats = group_tasks(rows, tasks)
+    settle(store, prices, task_stats=task_stats)
+    preds = store.predictions()
+    scored = [p for p in preds if p["status"] == "scored"][-last:]
+    return {
+        "recorded": {
+            "total": len(preds),
+            "by_origin": _count(p["origin"] for p in preds),
+            "by_status": _count(p["status"] for p in preds),
+        },
+        "last": last,
+        "scored": _score(scored),
+        "backtest": {
+            "computed": backtest_computed(rows, task_stats, tasks),
+            "turns": backtest_turns(task_stats),
+        },
+    }
+
+
+def _count(xs) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for x in xs:
+        out[x] = out.get(x, 0) + 1
+    return out
+
+
+def _score(scored: list[dict]) -> dict[str, Any]:
+    n = len(scored)
+    with_interval = [p for p in scored if p["prediction"].get("turns") and not p["prediction"]["turns"]["spread"]]
+    no_interval = [p for p in scored if p["prediction"].get("turns") and p["prediction"]["turns"]["spread"]]
+    no_history = n - len(with_interval) - len(no_interval)
+
+    def inside(lo: float, x: float, hi: float) -> bool:
+        return lo <= x <= hi
+
+    turns_in = sum(1 for p in with_interval if inside(
+        p["prediction"]["turns"]["p10"], p["outcome"]["turns_main"], p["prediction"]["turns"]["p90"]))
+    has_turns = with_interval + no_interval
+    turn_err = [abs(p["outcome"]["turns_main"] - p["prediction"]["turns"]["p50"]) for p in has_turns]
+    turn_ratio = [p["outcome"]["turns_main"] / p["prediction"]["turns"]["p50"]
+                  for p in has_turns if p["prediction"]["turns"]["p50"]]
+    priced = [p for p in with_interval if p["prediction"].get("cost") and not p["outcome"]["unpriced_calls"]]
+    cost_in = sum(1 for p in priced if inside(
+        p["prediction"]["cost"]["p10"], p["outcome"]["cost"], p["prediction"]["cost"]["p90"]))
+    cost_ratio = [p["outcome"]["cost"] / p["prediction"]["cost"]["p50"]
+                  for p in priced if p["prediction"]["cost"]["p50"]]
+    inp_err = [(p["outcome"]["first_input"] - p["prediction"]["input_next"]) / p["outcome"]["first_input"]
+               for p in scored if p["outcome"]["first_input"]]
+    cache_ok = sum(1 for p in scored if _cache_as_said(
+        p["prediction"]["cached"], p["outcome"]["first_cache_read"], p["outcome"]["first_input"]))
+    fam = [p for p in scored if p["prediction"]["family_source"] != "declared"]
+    return {
+        "n": n,
+        "with_interval": len(with_interval),
+        "no_interval_spread": len(no_interval),
+        "no_history": no_history,
+        "turns_inside": turns_in,
+        "turns_median_abs_error": percentile(turn_err, 50),
+        "turns_median_actual_over_p50": percentile(turn_ratio, 50),
+        "cost_scored": len(priced),
+        "cost_inside": cost_in,
+        "cost_median_actual_over_p50": percentile(cost_ratio, 50),
+        "input_median_error": percentile(inp_err, 50),
+        "input_within_5pct": sum(1 for e in inp_err if abs(e) <= 0.05),
+        "input_scored": len(inp_err),
+        "cache_as_said": cache_ok,
+        "family_guessed": len(fam),
+        "family_same_after": sum(1 for p in fam if p["prediction"]["family"] == p["outcome"]["family_after"]),
+    }
+
+
+def _cache_as_said(cached: int, read: int, first_input: int) -> bool:
+    """Warm or cold as stated. Warm: 90% or more of what was said to be cached was read.
+    Cold: under 10% of the call's input was read (a short shared prefix may survive)."""
+    if cached == 0:
+        return read < 0.1 * first_input
+    return read >= 0.9 * cached
+
+
+# ------------------------------------------------------------------ backtests
+
+
+def backtest_computed(rows, task_stats: list[TaskStats], tasks: dict) -> dict[str, Any]:
+    """For every prompt of yours that followed a call in the same session: was the
+    computed part right? Uses only what estimate would have known at that moment."""
+    from .estimate import chars_per_token
+
+    ratio, _ = chars_per_token(rows)
+    main_by_session: dict[str, list] = {}
+    for r in rows:
+        if r.trigger != "subagent":
+            main_by_session.setdefault(r.session_key, []).append(r)
+    first_of_task = {(t.session_key, t.task_id) for t in task_stats if t.tracked}
+    errors, cold, warm = [], [], []
+    for key, main in main_by_session.items():
+        for prev, cur in zip(main, main[1:]):
+            if cur.trigger != "user_turn" or (key, cur.task_id) not in first_of_task or prev.task_id == cur.task_id:
+                continue
+            if cur.extra.get("after_compaction") or cur.input_total < 0.5 * prev.input_total or not prev.input_total:
+                continue
+            t0, t1 = parse_ts(prev.ts), parse_ts(cur.ts)
+            if not (t0 and t1):
+                continue
+            gap = (t1 - t0).total_seconds()
+            prompt_chars = int((tasks.get((cur.source, cur.task_id)) or {}).get("prompt_chars") or 0)
+            predicted = prev.input_total + prev.output + round(prompt_chars / ratio)
+            errors.append((cur.input_total - predicted) / cur.input_total)
+            ttl = "1h" if prev.cache_write_1h else "5m"
+            if prev.input_total < 4096:
+                continue
+            share = cur.cache_read / prev.input_total
+            if cur.model != prev.model or gap > TTL_SECONDS[ttl]:
+                cold.append(share)
+            else:
+                warm.append(share)
+    return {
+        "prompts": len(errors),
+        "input_median_error": percentile(errors, 50),
+        "input_p10_error": percentile(errors, 10),
+        "input_p90_error": percentile(errors, 90),
+        "input_within_5pct": sum(1 for e in errors if abs(e) <= 0.05),
+        "cold_said": len(cold),
+        "cold_was_cold": sum(1 for s in cold if s < 0.1),
+        "cold_median_read_share": percentile(cold, 50),
+        "warm_said": len(warm),
+        "warm_was_warm": sum(1 for s in warm if s >= 0.9),
+        "warm_median_read_share": percentile(warm, 50),
+    }
+
+
+def backtest_turns(task_stats: list[TaskStats]) -> dict[str, Any]:
+    """Each task's turns against the p10-p90 the tasks before it would have given.
+
+    Two bases. "all": every earlier task; nothing about the task itself is used.
+    "family": earlier tasks of its family, as estimate does; but here the family
+    is the one guessed from the task's own first tool calls, which estimate
+    cannot know (it guesses from your text), so this one is optimistic.
+    """
+    ts = sorted((t for t in task_stats if t.tracked and t.turns_main and t.first_input), key=lambda t: t.started)
+    seen_all: list[int] = []
+    seen_fam: dict[str, list[int]] = {}
+    res = {b: {"n": 0, "inside": 0, "spread": 0, "abs_err": []} for b in ("all", "family")}
+    for t in ts:
+        for b, basis in (("all", seen_all), ("family", seen_fam.get(t.family or "?", []))):
+            if len(basis) < MIN_BASIS:
+                continue
+            p10, p50, p90 = (percentile_sorted(basis, q) for q in (10, 50, 90))
+            r = res[b]
+            if p10 and p90 / p10 >= SPREAD_LIMIT:  # type: ignore[operator]
+                r["spread"] += 1
+                continue
+            r["n"] += 1
+            r["inside"] += int(p10 <= t.turns_main <= p90)  # type: ignore[operator]
+            r["abs_err"].append(abs(t.turns_main - p50))  # type: ignore[operator]
+        bisect.insort(seen_all, t.turns_main)
+        bisect.insort(seen_fam.setdefault(t.family or "?", []), t.turns_main)
+    for r in res.values():
+        r["median_abs_error"] = percentile(r.pop("abs_err"), 50)
+    return res
+
+
+# ------------------------------------------------------------------ turns per family
+
+
+def build_turns(store: Store, prices: PriceTable) -> dict[str, Any]:
+    tasks = store.tasks()
+    ts = [t for t in group_tasks(enrich(store.records(), prices, tasks), tasks)
+          if t.tracked and t.turns_main and t.first_input]
+    fams = {}
+    for fam in list(FAMILIES) + [None]:
+        mine = ts if fam is None else [t for t in ts if t.family == fam]
+        fams[fam or "all"] = {
+            "tasks": len(mine),
+            "declared": sum(1 for t in mine if t.family_source == "declared"),
+            "turns_main": distribution([t.turns_main for t in mine]),
+            "turns_all_calls": distribution([t.turns for t in mine]),
+        }
+    return {"families": fams, "spread_limit": SPREAD_LIMIT}
+
+
+def verdict(d: Optional[dict]) -> str:
+    if not d:
+        return "no tasks"
+    if d["n"] < MIN_BASIS:
+        return f"too few (estimate needs {MIN_BASIS})"
+    if d["spread"]:
+        return "too spread: no interval given"
+    if d["ratio"] < 4:
+        return "tight"
+    return "wide"
+
+
+def render_turns(rep: dict[str, Any]) -> str:
+    out = ["tokentrail turns: how many model calls a task takes, by family", ""]
+    rows = []
+    for fam, d in rep["families"].items():
+        m, a = d["turns_main"], d["turns_all_calls"]
+        if not m:
+            rows.append([fam, "0", "", "", "", "", "", "no tasks"])
+            continue
+        rows.append([fam, f"{d['tasks']:,}", _n(m["p10"]), _n(m["p50"]), _n(m["p90"]),
+                     "x" + (f"{m['ratio']:.0f}" if m["ratio"] != float("inf") else "?"),
+                     f"{_n(a['p50'])} / {_n(a['p90'])}", verdict(m)])
+    out += _table(["family", "tasks", "p10", "median", "p90", "p90/p10", "all calls p50/p90", ""],
+                  rows, {1, 2, 3, 4, 5, 6})
+    out.append("")
+    out.append("  p10 / median / p90: main-thread model calls per task, the ones that each re-read the whole")
+    out.append("  context, so the cost of a task is roughly turns x context size. All calls adds sub-agents.")
+    out.append(f"  A family whose p90 is {rep['spread_limit']}x its p10 or more (two orders of magnitude) gets no")
+    out.append("  interval from `estimate`: one that wide would cover everything and say nothing.")
+    declared = sum(d["declared"] for f, d in rep["families"].items() if f != "all")
+    total = rep["families"]["all"]["tasks"]
+    out.append(f"  Families: {declared:,} of {total:,} declared with `tokentrail tag`, the rest guessed from each")
+    out.append("  task's first tool calls. `estimate` guesses from your text instead; `score` says how often")
+    out.append("  the two agree.")
+    return "\n".join(out)
+
+
+def render_score(rep: dict[str, Any]) -> str:
+    r, s, bt = rep["recorded"], rep["scored"], rep["backtest"]
+    out = ["tokentrail score: what estimate said vs what happened", ""]
+    st = r["by_status"]
+    out.append(f"Recorded estimates: {r['total']} ({_fmt_counts(r['by_origin'])}); "
+               f"{st.get('scored', 0)} scored, {st.get('linked', 0)} waiting for their task to finish, "
+               f"{st.get('open', 0)} waiting for a task to start, {st.get('unmatched', 0)} never followed by a task"
+               + (f", {st['superseded']} replaced by a later estimate of the same task" if st.get("superseded") else ""))
+    out.append("")
+    if not s["n"]:
+        out.append("No estimate scored yet. Every `estimate` and every prompt seen by the hook is recorded;")
+        out.append("each is scored once the task it preceded is over. Until then the turn estimate is unvalidated.")
+    else:
+        out.append(f"Last {s['n']} scored estimates")
+        n_i = s["with_interval"]
+        out.append(f"  turns inside p10-p90          {_of(s['turns_inside'], n_i)}   (a calibrated 10-90 interval holds ~80%)")
+        out.append(f"  turns, median error           {_num(s['turns_median_abs_error'])} turns; "
+                   f"median actual / predicted median x{_num(s['turns_median_actual_over_p50'], 2)}")
+        out.append(f"  cost inside its band          {_of(s['cost_inside'], s['cost_scored'])}   "
+                   f"median actual / predicted x{_num(s['cost_median_actual_over_p50'], 2)} "
+                   "(the band leaves out output and sub-agents)")
+        if s["no_interval_spread"]:
+            out.append(f"  no interval given (spread)    {s['no_interval_spread']}")
+        if s["no_history"]:
+            out.append(f"  no history to estimate from   {s['no_history']}")
+        out.append(f"  next-call input (computed)    median error {_pct(s['input_median_error'])}, "
+                   f"within 5%: {_of(s['input_within_5pct'], s['input_scored'])}")
+        out.append(f"  cache warm/cold as stated     {_of(s['cache_as_said'], s['n'])}")
+        if s["family_guessed"]:
+            out.append(f"  family from your text = family from the task's tools: "
+                       f"{_of(s['family_same_after'], s['family_guessed'])}")
+    c = bt["computed"]
+    out.append("")
+    out.append("Backtest on your history: the computed part (what estimate would have said before each prompt)")
+    if c["prompts"]:
+        out.append(f"  next-call input = last input + last answer + your text: {c['prompts']:,} prompts, "
+                   f"median error {_pct(c['input_median_error'])} (p10 {_pct(c['input_p10_error'])}, "
+                   f"p90 {_pct(c['input_p90_error'])}), within 5%: {_of(c['input_within_5pct'], c['prompts'])}")
+        out.append(f"  said cold (idle past the TTL or model switch): {_of(c['cold_was_cold'], c['cold_said'])} "
+                   f"read under 10% of the context from cache (median {_share(c['cold_median_read_share'])})")
+        out.append(f"  said warm: {_of(c['warm_was_warm'], c['warm_said'])} read 90% or more "
+                   f"(median {_share(c['warm_median_read_share'])})")
+    else:
+        out.append("  no prompt follows an earlier call in the same session yet")
+    t = bt["turns"]
+    out.append("")
+    out.append("Backtest on your history: turn intervals, each task against the tasks before it")
+    for b, label in (("all", "basis: all earlier tasks"),
+                     ("family", "basis: earlier tasks of its family (optimistic: family guessed from its own tools)")):
+        d = t[b]
+        line = (f"  {label}: {_of(d['inside'], d['n'])} inside p10-p90, median error "
+                f"{_num(d['median_abs_error'])} turns")
+        if d["spread"]:
+            line += f"; {d['spread']} without an interval (too spread)"
+        out.append(line)
+    return "\n".join(out)
+
+
+def _fmt_counts(d: dict) -> str:
+    return ", ".join(f"{k} {v}" for k, v in sorted(d.items())) or "none"
+
+
+def _of(k: int, n: int) -> str:
+    return f"{k} of {n}" + (f" ({100 * k / n:.0f}%)" if n else "")
+
+
+def _num(x: Optional[float], digits: int = 1) -> str:
+    return "?" if x is None else f"{x:.{digits}f}"
+
+
+def _pct(x: Optional[float]) -> str:
+    return "?" if x is None else f"{100 * x:+.1f}%"
+
+
+def _share(x: Optional[float]) -> str:
+    return "?" if x is None else f"{100 * x:.0f}%"
+
+
+def _n(x: Optional[float]) -> str:
+    return "?" if x is None else str(round(x))
+

@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS task_tags (
     family TEXT NOT NULL,
     PRIMARY KEY (source, task_id)
 );
+-- Not derived: what estimate said, when, and later what happened. Kept across
+-- schema upgrades like task_tags. Numbers only: never the prompt text.
+CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    made_at TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    prediction TEXT NOT NULL,
+    task_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    outcome TEXT
+);
+CREATE INDEX IF NOT EXISTS predictions_status ON predictions (status);
 CREATE TABLE IF NOT EXISTS file_events (
     session_key TEXT NOT NULL,
     task_id TEXT NOT NULL,
@@ -197,6 +210,38 @@ class Store:
                     "INSERT OR REPLACE INTO task_tags VALUES (?,?,?)", (source, ids[0], family)
                 )
         return ids
+
+    # ------------------------------------------------------------ predictions
+    def add_prediction(self, made_at: str, origin: str, session_key: str, prediction: dict) -> int:
+        with self.db:
+            cur = self.db.execute(
+                "INSERT INTO predictions (made_at, origin, session_key, prediction) VALUES (?,?,?,?)",
+                (made_at, origin, session_key, json.dumps(prediction)),
+            )
+        return int(cur.lastrowid or 0)
+
+    def predictions(self, status: Optional[str] = None) -> list[dict]:
+        q = "SELECT * FROM predictions" + (" WHERE status = ?" if status else "") + " ORDER BY made_at, id"
+        out = []
+        for r in self.db.execute(q, (status,) if status else ()):
+            d = dict(r)
+            d["prediction"] = json.loads(d["prediction"])
+            d["outcome"] = json.loads(d["outcome"]) if d["outcome"] else None
+            out.append(d)
+        return out
+
+    def has_open_predictions(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM predictions WHERE status IN ('open', 'linked') LIMIT 1").fetchone() is not None
+
+    def settle_prediction(self, pid: int, status: str, task_id: Optional[str] = None,
+                          outcome: Optional[dict] = None) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE predictions SET status = ?, task_id = COALESCE(?, task_id), "
+                "outcome = COALESCE(?, outcome) WHERE id = ?",
+                (status, task_id, json.dumps(outcome) if outcome is not None else None, pid),
+            )
 
     # ------------------------------------------------------------ queries
     def records(

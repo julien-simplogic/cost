@@ -98,8 +98,24 @@ def test_hook_answers_with_a_user_only_message(env, capsys, monkeypatch):
     # systemMessage is shown to the user; nothing else, so nothing reaches the model's context
     assert set(out) == {"systemMessage"}
     msg = out["systemMessage"]
-    assert msg.startswith("tokentrail: next call ") and "floor $" in msg
+    # what is certain comes first: idle time, tokens re-written, dollars
+    assert msg.startswith("tokentrail: Idle for ") and "cache has expired" in msg and "tokens, $" in msg
     assert "12 files are loaded" in msg
+
+
+def test_hook_records_its_estimate_numbers_only(env, capsys, monkeypatch):
+    from tokentrail import paths
+    from tokentrail.store import Store
+
+    tp, s = _session(env)
+    secret = "rename the Zanzibar client"
+    _feed(monkeypatch, {"transcript_path": str(tp), "cwd": s.cwd, "prompt": secret})
+    main(["hook", "prompt"])
+    with Store(paths.db_path()) as st:
+        [p] = st.predictions()
+    assert p["origin"] == "hook" and p["status"] == "open"
+    assert p["prediction"]["prompt_chars"] == len(secret)
+    assert "Zanzibar" not in paths.db_path().read_bytes().decode("latin-1")
 
 
 def test_hook_is_silent_when_it_has_nothing_to_say_or_fails(env, capsys, monkeypatch):

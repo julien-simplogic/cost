@@ -46,6 +46,9 @@ def _all_commands(env) -> list[list[str]]:
         ["prices", "--init"],
         ["prices"],
         ["tag", "zzz", "review"],
+        ["turns"],
+        ["score"],
+        ["check"],
     ]
 
 

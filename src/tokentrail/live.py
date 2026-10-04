@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from . import estimate, paths, prices
+from . import estimate, paths, predictions, prices
 from .collectors import claude_code
 from .errors import TokentrailError
 from .record import totals_match
@@ -141,21 +141,30 @@ def prompt_hook(raw_stdin: str) -> Optional[str]:
             ))
         except TokentrailError:
             return None  # first prompt of a session: nothing to start from yet
+        try:
+            predictions.record(store, est, "hook")  # so that `tokentrail score` can grade it later
+        except Exception:  # noqa: BLE001 - never lose the message over the bookkeeping
+            pass
     return json.dumps({"systemMessage": hook_message(est)})
 
 
 def hook_message(est: dict[str, Any]) -> str:
-    c, p, f = est["computed"], est["predicted"], est["frame"]
-    line = (
-        f"tokentrail: next call {c['input_next']:,} tokens in ({c['cached']:,} cached), "
-        f"floor {fmt_cost(f['floor']['cost'])}"
-    )
-    if p.get("cost"):
-        lo, hi = p["cost"]
+    """First what is certain (idle time, cache, what re-writing costs), then the unvalidated estimate."""
+    p = est["predicted"]
+    lines = ["tokentrail: " + " ".join(est["certain"])]
+    if p.get("turns"):
         basis = f"{p['samples']} past '{p['family']}' tasks" if p.get("basis_is_family") else (
             f"all {p['samples']} past tasks, too few '{p['family']}' ones")
-        line += f"; this task p10-p90 {fmt_cost(lo)}-{fmt_cost(hi)} ({basis})"
-    lines = [line] + [f"  ! {w}" for w in est["warnings"]]
+        t, c = p["turns"], p.get("cost")
+        if t["spread"]:
+            lines.append(f"  turns too spread to estimate ({basis}): p10 {t['p10']:.0f}, p90 {t['p90']:.0f}")
+        else:
+            line = f"  unvalidated estimate: {t['p10']:.0f}-{t['p90']:.0f} turns, median {t['p50']:.0f} ({basis})"
+            if c:
+                line += (f" x context = {fmt_cost(c['p10'])}-{fmt_cost(c['p90'])}, "
+                         "output and sub-agents not included")
+            lines.append(line)
+    lines += [f"  ! {w}" for w in est["warnings"]]
     return "\n".join(lines)
 
 

@@ -80,6 +80,8 @@ def main() -> None:
         now = (last.last_call_at + timedelta(minutes=4, seconds=15)).isoformat()
         cli(["estimate", "--no-ingest", "--now", now, "--session", last.session_id[:8], "--family", "refactor",
              "--edits", "CLAUDE.md", "split the cart service in two"])
+        print("\n$ tokentrail turns\n")
+        cli(["turns", "--no-ingest"])
 
 
 if __name__ == "__main__":

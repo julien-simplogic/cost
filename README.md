@@ -1,6 +1,6 @@
 # tokentrail
 
-**Where your Claude Code tokens go, and what a prompt will cost before you send it.**
+**Where your Claude Code tokens go, and what your next message is sure to cost before you send it.**
 
 A local command-line tool. It reads the session transcripts Claude Code already
 writes on your machine. No API key, no instrumentation, no network: nothing
@@ -150,6 +150,14 @@ How tokentrail turns this into a verdict, on the first line of every report:
   snapshots, Claude Code restarted counting, and the report says so.
 - Otherwise "Partly verified", with the totals flagged as a minimum.
 
+**On the author's machine**, said with its sample size: on Claude Code
+2.1.283, 15 of the 21 sessions that ran on that version alone match its
+counter to the token, and none contradicts it. Where both sides cover the same
+calls (26 sessions), the call lines are a floor short by +0.23% on input and
+cache, and by +12.7% on output (about 1% of the cost). 15 of 21 is a small
+sample. It is the reason to trust the rest only as far as `tokentrail check`
+confirms it on your own sessions.
+
 **What it does not prove.** That Claude Code's counter equals what you are
 billed: it is Claude Code's number, not Anthropic's invoice. Sub-agent output
 is under-logged, [see below](#how-sure-are-these-numbers). If a session carries
@@ -158,15 +166,27 @@ be checked.
 
 ## Why
 
-Over one real week of development with Claude Code, the author used 14 million
-tokens. Only afterwards did it become clear that 44% of them had gone into
-sub-agents launched in parallel and full re-reads of the code.
+The author's plan limits melted without an obvious reason. The first guess,
+made after a week of work, was that 44% of the tokens went into sub-agents
+launched in parallel and full re-reads of the code. Measured with this tool
+over the whole local history (145 sessions, 3,892 tasks, 64,409 model calls),
+the guess was wrong:
+
+| where it went | tokens | cost at API prices |
+|---|---|---|
+| tool turns (the loop of calls between two of your messages) | 79% | 68% |
+| your messages | 8% | 20% |
+| sub-agents | 12% | 7% |
+| reviews and re-reads | 1% | 4% |
+
+Sub-agents and re-reads together: 13% of tokens, not 44%. Cache lost to idle
+time or to a changed prompt prefix: 21% of the cost. Input is 99.8% of tokens;
+output, 0.24%. These are one person's figures on one machine; yours will
+differ, which is the point of measuring them.
 
 Existing tools measure API spend. None of them says *where* the budget of
-assisted development goes (your messages, tool loops, sub-agents, re-reads),
-or what a request will cost *before* you launch it.
-
-tokentrail does both, from the history you already have.
+assisted development goes, or what the next message will cost *before* you
+send it. tokentrail does both, from the history you already have.
 
 ## What it does
 
@@ -233,6 +253,9 @@ $ tokentrail estimate --family refactor "split the cart service in two"
 
 tokentrail estimate: session f3be8698 (harbor-api), claude-opus-5-5
 
+Cache warm (5m TTL, expires in 45 s): your next message reads 91,002 of its 91,914 tokens
+from cache, $0.023. Send now or it re-writes them all.
+
 Computed (from the session's last real call)
   last call input                  91,002
   + its answer                        900
@@ -241,57 +264,132 @@ Computed (from the session's last real call)
     already cached                 91,002   (TTL 5m, last call 4 min ago)
     written to cache                  912
   Your text is 12 tokens; the call sends 91,914: system prompt, tools, files and history ride along.
+  (text -> tokens at 2.5 chars/token, default, too little history to calibrate; no network tokenizer)
 
-Predicted (p10-p90 of 15 past 'refactor' tasks; family 'refactor', declared)
-  model calls                13 - 32   (main thread 8 - 26)
-  input over the task        1.1M - 3.8M
-  output over the task       8k - 24k
-  cost                       $0.918 - $3.18
+Unvalidated estimate: turns from 15 past 'refactor' tasks (family 'refactor', declared)
+  model calls (main thread)  8 - 26, median 17
+  cost of those turns        $0.159 - $0.479, median $0.317
+                             (turns x context; output and sub-agents not included)
+  Not yet compared with outcomes: `tokentrail score` says how past estimates fared.
 
 Frame
   floor (exact)        $0.023   the first call's input, paid whatever happens
-  ceiling             $306.17   27 turns x 128,000 max_tokens, context re-sent each turn
+  ceiling             $306.17   27 turns (your max for this basis) x 128,000 max_tokens,
+                                context re-sent each turn
                                 tool results and sub-agents have no fixed cap and are not in it
 
 Warnings
-  ! The 5m cache expires in 45 s: send now or pay to re-write 92k tokens.
-  ! CLAUDE.md is part of the prompt prefix: changing it breaks the cache prefix, and the next call
-    that reloads it re-writes the whole context (~92k tokens, $0.460).
+  ! CLAUDE.md: whether Claude Code re-reads it mid-session, and where it sits in the prompt, is
+    not in the transcripts, and your history has no such edit to measure; if it does, the whole
+    92k-token context is written again ($0.460).
 ```
 
-It keeps two kinds of numbers apart:
+Three kinds of numbers, never mixed:
 
-- **Computed.** The next call's input is *not* the text you type. It is the
-  whole assembled context: system prompt, tools, files, history. Estimating
-  from your text alone would say 12 tokens when the call sends 92,000. So the
-  estimate starts from the **real input count of the session's last call**,
-  read from the transcript, then adds its answer and what you are adding. The
-  cached part comes from comparing with that previous call: same model, and
-  still inside the cache TTL Claude Code used (5 min or 1 h).
-- **Predicted.** Model calls and output come from **your own history**, as the
-  10th-90th percentile of comparable past tasks. They are never shown as a
-  mean, because the distribution has a long tail. Tasks fall into four families
-  (question, refactor, review, measure). A family is guessed from a task's first
-  tool calls, or from your text for the estimate. You can always declare it
-  (`--family`, or `tokentrail tag <task> <family>` for past tasks).
+- **Certain, stated first.** Arithmetic on a state the transcript shows. The
+  next call's input is *not* the text you type: it is the whole assembled
+  context (system prompt, tools, files, history). Estimating from your text
+  alone would say 12 tokens when the call sends 92,000. So it starts from the
+  **real input count of the session's last call**, read from the transcript,
+  plus its answer and what you are adding. Whether that context is still
+  cached follows from the idle time, the cache TTL Claude Code used (5 min or
+  1 h) and the model. After a long pause the first line reads, for example:
+  `Idle for 48 min: the 5m cache has expired. Your next message re-writes the
+  whole context, 91,915 tokens, $0.460 ($0.437 more than with a warm cache).`
+- **Unvalidated estimate.** The one real unknown is how many turns the task
+  will take. tokentrail does not try to predict output (on the author's
+  history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
+  the 10th, 50th and 90th percentiles of main-thread turns over your past
+  tasks of the same family, never a mean, and multiplies by the context size.
+  When a family's turns spread over two orders of magnitude (p90 ≥ 100 × p10),
+  it says so and gives no interval: one that wide covers everything and says
+  nothing. **This part has not been checked against outcomes yet**, which is
+  why it is called an estimate, not a prediction. Every estimate is recorded
+  so that `tokentrail score` can check it (see below).
+- **The frame.** The floor is exact: the first call's input is paid whatever
+  happens. The ceiling counts `max_tokens` on every turn up to the turn
+  limit and re-sends the growing context on every turn. Tool results and
+  sub-agents have no fixed size, so they are left out of the ceiling, and the
+  output says so.
 
-The **frame** gives the full range. The floor is exact: the first call's input
-is paid whatever happens. The ceiling counts `max_tokens` on every turn up to
-the turn limit. It also re-sends the growing context on every turn, because
-every call re-reads it. (Input + `max_tokens` × turns would understate the
-ceiling.) Tool results and sub-agents have no fixed size, so they are left out
-of the ceiling, and the output says so.
+Families are question, refactor, review and measure. A past task's family is
+guessed from its first tool calls; for the estimate, from your text. Declare it
+when you know (`--family`, or `tokentrail tag <task> <family>` for past tasks).
 
-The most useful part is often the warnings:
+**What a CLAUDE.md edit costs is measured, not asserted.** Where Claude Code
+puts `CLAUDE.md` in the prompt, and whether it re-reads it mid-session, is not
+written in the transcripts, so tokentrail cannot say "the prefix breaks at
+character 3,200". What it can say is what happened on your history: each time
+a tool wrote `CLAUDE.md`, a settings file or something under `.claude/`, did
+the next call find its cache? `tokentrail check` counts it, and attributes
+every cache break to what the transcript shows just before it: a model switch,
+such an edit, or nothing visible. Edits made in your own editor are not in the
+transcripts and land in "nothing visible".
+
+Other warnings:
 
 | Warning | When |
 |---|---|
-| cache expired / about to expire | time since the last call vs. the TTL Claude Code used |
-| prefix break | `--model` differs from the session's, or `--edits` names a file that is part of the prefix (`CLAUDE.md`, `.mcp.json`, settings) |
+| prefix file edited | `--edits` names `CLAUDE.md`, `.mcp.json`, a settings file or a `.claude/` path, with what such edits did on your history |
 | past prefix breaks | this session already lost its cache mid-way, with the cost |
 | files loaded, never used | ≥ 10 files read into the context, ≥ 70% never edited or opened again, plus your historical edit rate for that family |
 | large context | every further turn re-reads it; `/compact` or a fresh session resets it |
 | sub-agent heavy | ≥ 30% of this family's tokens historically went to sub-agents |
+
+### `tokentrail turns`: how many turns a task takes
+
+```
+$ tokentrail turns
+
+tokentrail turns: how many model calls a task takes, by family
+
+family    tasks  p10  median  p90  p90/p10  all calls p50/p90
+--------  -----  ---  ------  ---  -------  -----------------  --------------------------
+question      6    1       1    1       x1              1 / 1  too few (estimate needs 8)
+refactor     16    8      18   26       x3            23 / 32  tight
+review        7    7       8   12       x2            17 / 22  too few (estimate needs 8)
+measure      11    2       2    2       x1              2 / 2  tight
+all          40    1       8   23      x23            14 / 26  wide
+
+  p10 / median / p90: main-thread model calls per task, the ones that each re-read the whole
+  context, so the cost of a task is roughly turns x context size. All calls adds sub-agents.
+  A family whose p90 is 100x its p10 or more (two orders of magnitude) gets no
+  interval from `estimate`: one that wide would cover everything and say nothing.
+  Families: 0 of 40 declared with `tokentrail tag`, the rest guessed from each
+  task's first tool calls. `estimate` guesses from your text instead; `score` says how often
+  the two agree.
+```
+
+(Invented demo data, as everywhere in this README.) Main-thread turns are the
+calls that each re-read the whole context, so the cost of a task is roughly
+turns × context size. Read the p90/p10 column before trusting any interval.
+
+### `tokentrail score`: the estimate grades itself
+
+A prediction that is never scored is an opinion. Every `tokentrail estimate`
+(unless `--no-record`) and every prompt seen by the hook records what it said:
+numbers only, never your text. Each record is linked to the next task that
+starts in the same session within 30 minutes. Once that task is over (a later
+task started, or an hour without activity), its outcome is written next to the
+estimate and kept, even after Claude Code deletes old transcripts.
+
+`tokentrail score` then reports, over the last N scored estimates (`--last`,
+default 50):
+
+- how many outcomes fell inside the p10-p90 turn interval (a calibrated
+  interval holds about 80%), and the median error in turns;
+- the same for the cost band, with the median ratio actual / estimated (the
+  band leaves out output and sub-agents, so expect it to run low);
+- the computed part: next-call input error, and whether the cache was warm or
+  cold as stated;
+- how often the family guessed from your text matched the one guessed later
+  from the task's tool calls.
+
+It also backtests on your whole history what needs no recorded estimate: the
+computed next-call input and cache state before each of your prompts, and the
+turn interval each task would have got from the tasks before it. The
+per-family backtest uses the family guessed from the task's own tool calls,
+which the estimate cannot know, and is labelled optimistic.
 
 ## Live display, while you work
 
@@ -328,13 +426,18 @@ read, and a model missing from the price file. The status line reads only the
 session's transcript, so it needs no history; on a 1.3 MB session it takes
 about 0.15 s.
 
-**Prompt hook (`UserPromptSubmit`).** When you send a prompt, it shows the
-estimate and the warnings:
+**Prompt hook (`UserPromptSubmit`).** When you send a prompt, it shows first
+what is certain (idle time, cache state, what re-writing costs), then the
+unvalidated turn estimate and the warnings:
 
 ```
-tokentrail: next call 430,797 tokens in (429,141 cached), floor $0.099; this task p10-p90 $0.230-$7.11 (all 10 past tasks, too few 'review' ones)
-  ! Large context (431k): every further turn re-reads it (~$0.086 per turn from cache, 27 turns at p90). /compact or a fresh session resets it.
+tokentrail: Idle for 48 min: the 5m cache has expired. Your next message re-writes the whole
+context, 91,915 tokens, $0.460 ($0.437 more than with a warm cache).
+  unvalidated estimate: 1-20 turns, median 7 (all 39 past tasks, too few 'question' ones)
+  x context = $0.460-$0.805, output and sub-agents not included
 ```
+
+Each of these is recorded for `tokentrail score`, numbers only.
 
 Built on Claude Code's documented interface (code.claude.com/docs/en/hooks
 and /statusline), read before writing it.
@@ -351,7 +454,7 @@ and /statusline), read before writing it.
 - **The hook only answers with `systemMessage`.**
 - **It never blocks or slows a prompt.** It always exits 0. On any error it
   prints nothing. The suggested timeout is 10 s, against a default of 30. It
-  reads only the current session, and predictions use whatever history
+  reads only the current session, and the turn estimate uses whatever history
   `tokentrail ingest` stored before.
 - **The status line always prints one line**, even on garbage input.
 
@@ -412,13 +515,17 @@ tokentrail diagnose <session>           # one session vs Claude Code's counter, 
 tokentrail setup                        # the settings.json lines for the live display
 tokentrail estimate "add retries to the payment client"
 tokentrail estimate --file prompt.md --add src/payments.py --family refactor
+tokentrail turns                        # turns per task by family: p10, median, p90
+tokentrail score --last 30              # past estimates vs what happened, plus a backtest
 tokentrail tag 3df37995 review          # declare a past task's family
 tokentrail prices                       # show the price file and its date
 tokentrail prices --init                # copy it to your data dir to edit
 tokentrail where                        # what it reads, where it writes
 ```
 
-`report` and `estimate` read new or changed transcripts first (incremental).
+`report`, `check`, `estimate`, `turns` and `score` read new or changed
+transcripts first (incremental), then record the outcome of any finished task
+an estimate was waiting for.
 `estimate` uses the latest session started in the current directory, or
 `--session <id prefix>`.
 
@@ -499,8 +606,12 @@ Families and categories are heuristics. The code is short and readable:
 ## Architecture
 
 ```
-collectors/ (one per source)  ->  UsageRecord  ->  SQLite (local)  ->  report / estimate
+collectors/ (one per source)  ->  UsageRecord  ->  SQLite (local)  ->  report / estimate / score
 ```
+
+Everything in the database is rebuilt from the transcripts, except two tables
+nothing else can rebuild: families you declared (`tag`) and recorded
+estimates with their outcomes (`score`). Those survive upgrades.
 
 Each source has a collector, and every collector emits the same record. That
 record is the contract. v0 ships one collector (Claude Code, local). Other
@@ -555,7 +666,8 @@ tests (`tests/test_privacy.py`), run in CI on every push:
 
 tokentrail writes to `$TOKENTRAIL_HOME`, or by default to
 `~/.local/share/tokentrail` (`%LOCALAPPDATA%\tokentrail` on Windows). Prompt
-text is never stored, only its length.
+text is never stored, only its length; recorded estimates hold numbers only,
+and a test checks that a prompt's words are not in the database.
 
 ## What v0 does not see: cloud sessions
 
@@ -589,7 +701,10 @@ Honest options, none of them complete:
   a characters-per-token ratio calibrated on your own history (the output
   shows the ratio and its basis). That ratio sits in the input *delta*. The
   base, the last call's real input, comes straight from the transcript.
-- Windows is not covered by CI yet.
+- **No validated turn estimate yet.** The scoring loop exists; the scores
+  do not, until enough estimates have met their outcome. Until `tokentrail
+  score` says otherwise on your own history, read the turn interval as a
+  guess with a stated basis.
 
 ## Development
 

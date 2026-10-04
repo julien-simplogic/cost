@@ -1,12 +1,16 @@
-"""Command 2: what the next prompt will cost, before you send it.
+"""Command 2: what the next message costs, before you send it.
 
 Two kinds of numbers, kept apart:
 
-computed   the input of the next call: the real input of the session's last
-           call (from the transcript), plus what you are adding. And how much
-           of it is already cached.
-predicted  turns and output, as the 10th-90th percentile of your own past
-           tasks of the same family. Never a mean: the tail is long.
+certain    arithmetic on a state the transcript shows: the input of the next
+           call (the real input of the session's last call, plus what you are
+           adding), how much of it is still cached given the idle time and the
+           cache TTL, and what re-writing the rest costs.
+estimated  the number of turns the task will take, as the 10th, 50th and 90th
+           percentiles of your own past tasks of the same family, times the
+           context size. Output is not predicted. This part is unvalidated until
+           `tokentrail score` has compared enough estimates with what happened;
+           every estimate is recorded for that (numbers only, never the text).
 
 Plus the frame: an exact floor (the first call's input, paid whatever
 happens) and a ceiling (max_tokens on every turn up to the turn limit).
@@ -22,7 +26,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .analysis import (
-    TTL_SECONDS, Row, cache_events, enrich, group_tasks, parse_ts, percentile, ttl_of,
+    TTL_SECONDS, Row, cache_events, distribution, enrich, group_tasks, is_prefix_file,
+    parse_ts, ttl_of,
 )
 from .prices import PriceTable
 from .report import fmt_cost, fmt_tokens
@@ -33,7 +38,6 @@ DEFAULT_CHARS_PER_TOKEN = 2.5  # observed 1.8-2.7 on code and JSON with current 
 MIN_CALIBRATION = 10
 MIN_FAMILY_SAMPLES = 8
 LARGE_CONTEXT = 100_000
-PREFIX_FILES = {"CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "settings.json", "settings.local.json"}
 
 _FAMILY_WORDS = {
     "review": r"\b(review|relis|relecture|relire|audit|vérifie|verifie|check the code|code review)\w*",
@@ -169,7 +173,8 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     if family is None:
         family = guess_family_from_text(inp.text)
     # past tasks; the one still running in this session is not history yet
-    hist = [t for t in group_tasks(all_rows, tasks) if t.first_input > 0 and t.task_id != last.task_id]
+    hist = [t for t in group_tasks(all_rows, tasks)
+            if t.first_input > 0 and t.tracked and t.task_id != last.task_id]
     fam_hist = [t for t in hist if t.family == family]
     basis = fam_hist if len(fam_hist) >= MIN_FAMILY_SAMPLES else hist
     basis_label = (
@@ -177,24 +182,17 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         else f"all {len(hist)} past tasks ('{family}' has only {len(fam_hist)}, need {MIN_FAMILY_SAMPLES})"
     )
 
-    def band(vals: list[float]) -> Optional[tuple[float, float]]:
-        if not vals:
-            return None
-        return (percentile(vals, 10), percentile(vals, 90))  # type: ignore[return-value]
+    # Turns, not output: the number of main-thread calls decides how many times
+    # the context is re-read. Their spread decides whether an interval means anything.
+    turns = distribution([t.turns_main for t in basis])
+    turns_all = distribution([t.turns for t in basis])
+    cost = None
+    if turns and price and floor_cost is not None:
+        reread = input_next * price.cache_read / 1e6
 
-    turns = band([t.turns for t in basis])
-    turns_main = band([t.turns_main for t in basis])
-    output = band([t.output for t in basis])
-    in_ratio = band([t.input_total / t.first_input for t in basis])
-    cost_ratio = band([t.cost / t.first_input for t in basis if not t.unpriced])
-    expected = None
-    if in_ratio and output:
-        expected = {
-            "turns": turns, "turns_main": turns_main,
-            "input": (in_ratio[0] * input_next, in_ratio[1] * input_next),
-            "output": output,
-            "cost": (cost_ratio[0] * input_next, cost_ratio[1] * input_next) if cost_ratio else None,
-        }
+        def cost_at(n: float) -> float:
+            return floor_cost + max(n - 1, 0) * reread  # type: ignore[operator]
+        cost = {"p10": cost_at(turns["p10"]), "p50": cost_at(turns["p50"]), "p90": cost_at(turns["p90"])}
 
     # -------------------------------------------------------------- ceiling
     max_tokens = (
@@ -211,30 +209,11 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     ceil_cost = (ceil_in * price.input * mult + ceil_out * price.output) / 1e6 if price else None
 
     # ------------------------------------------------------------- warnings
+    certain = _certain(gap, ttl, warm, model, last, input_next, cached, floor_cost, warm_cost, t_last)
     warnings = []
-    if not warm and model == last.model and t_last:
-        warnings.append(
-            f"Your last call was {_ago(gap)} ago and the {ttl} cache has expired: this call "
-            f"writes the whole {fmt_tokens(input_next)}-token context again, "
-            f"{fmt_cost((floor_cost or 0) - (warm_cost or 0))} more than with a warm cache."
-        )
-    elif warm and TTL_SECONDS[ttl] - gap < 60:
-        warnings.append(
-            f"The {ttl} cache expires in {int(TTL_SECONDS[ttl] - gap)} s: send now or pay "
-            f"to re-write {fmt_tokens(input_next)} tokens."
-        )
-    if model != last.model:
-        warnings.append(
-            f"Switching model ({last.model} -> {model}) breaks the cache prefix: the whole "
-            f"{fmt_tokens(input_next)}-token context is written again."
-        )
-    for e in inp.edits:
-        if Path(e).name in PREFIX_FILES or "/.claude/" in f"/{e}":
-            warnings.append(
-                f"{e} is part of the prompt prefix: changing it breaks the cache prefix, and "
-                f"the next call that reloads it re-writes the whole context "
-                f"(~{fmt_tokens(input_next)} tokens, {fmt_cost(in_cost(0, input_next))})."
-            )
+    edited_prefix = [e for e in inp.edits if is_prefix_file(e)]
+    if edited_prefix:
+        warnings.append(_prefix_edit_note(store, prices, edited_prefix, input_next, in_cost(0, input_next)))
     breaks = [e for e in cache_events(main, prices) if e.kind == "break"]
     if breaks:
         warnings.append(
@@ -250,7 +229,7 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         warnings.append(
             f"Large context ({fmt_tokens(input_next)}): every further turn re-reads it "
             f"(~{fmt_cost(per_turn)} per turn from cache"
-            + (f", {int(turns_main[1])} turns at p90" if turns_main else "")
+            + (f", {int(turns['p90'])} turns at p90" if turns else "")
             + "). /compact or a fresh session resets it."
         )
     sub_share = _share([t.sub_tokens for t in fam_hist], [t.tokens for t in fam_hist])
@@ -263,7 +242,11 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         warnings.append("Could not read: " + ", ".join(unreadable_files))
 
     return {
+        "made_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "session": last.session_id[:8],
+        "session_key": session_key,
+        "prompt_chars": len(inp.text),
+        "certain": certain,
         "session_chosen": chosen,
         "project": last.project,
         "model": model,
@@ -281,12 +264,17 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
             "chars_per_token_samples": n_cal,
         },
         "predicted": {
+            "validated": False,
             "family": family,
             "family_source": family_source,
             "basis": basis_label,
             "basis_is_family": basis is fam_hist,
             "samples": len(basis),
-            **({k: v for k, v in expected.items()} if expected else {}),
+            "turns": turns,
+            "turns_all_calls": turns_all,
+            "cost": cost,
+            "method": "main-thread turns x next-call context at the cache-read price, plus the first call; "
+                      "output and sub-agents not included",
         },
         "frame": {
             "floor": {"input": input_next, "cost": floor_cost},
@@ -297,6 +285,66 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         },
         "warnings": warnings,
     }
+
+
+def _certain(gap, ttl, warm, model, last, input_next, cached, floor_cost, warm_cost, t_last) -> list[str]:
+    """What the transcript and the cache rules decide alone: no history, no guess."""
+    out = []
+    if model != last.model:
+        out.append(
+            f"Switching model ({last.model} -> {model}): nothing is cached for the new model. "
+            f"Your next message writes the whole context, {input_next:,} tokens, {fmt_cost(floor_cost)}."
+        )
+    elif not t_last:
+        out.append(f"Your next message sends {input_next:,} tokens; the last call has no timestamp, "
+                   "so whether the cache is still warm is unknown.")
+    elif not warm:
+        out.append(
+            f"Idle for {_ago(gap)}: the {ttl} cache has expired. Your next message re-writes the whole "
+            f"context, {input_next:,} tokens, {fmt_cost(floor_cost)} "
+            f"({fmt_cost((floor_cost or 0) - (warm_cost or 0))} more than with a warm cache)."
+        )
+    else:
+        left = TTL_SECONDS[ttl] - gap
+        out.append(
+            f"Cache warm ({ttl} TTL, expires in {_ago(left)}): your next message reads {cached:,} of its "
+            f"{input_next:,} tokens from cache, {fmt_cost(floor_cost)}."
+            + (" Send now or it re-writes them all." if left < 60 else "")
+        )
+    return out
+
+
+def _prefix_edit_note(store: Store, prices: PriceTable, edits: list[str], input_next: int,
+                      full_write: Optional[float]) -> str:
+    """What editing CLAUDE.md or settings did on your own history: measured, not assumed.
+
+    When Claude Code re-reads these files, and where they sit in the prompt, is
+    not written in the transcripts, so the position where the prefix breaks is
+    not known. What is known: after each time a tool wrote one of them, did the
+    next call find its cache?
+    """
+    from .analysis import BreakCauses, break_causes
+
+    tasks = store.tasks()
+    rows = enrich(store.records(), prices, tasks)
+    by: dict[str, list[Row]] = {}
+    for r in rows:
+        if r.trigger != "subagent":
+            by.setdefault(r.session_key, []).append(r)
+    total = BreakCauses()
+    events: dict[str, list] = {}
+    for e in store.file_events():
+        events.setdefault(e["session_key"], []).append(e)
+    for key, main in by.items():
+        if key in events:
+            total.add(break_causes(main, events[key], prices))
+    names = ", ".join(edits)
+    worst = f"if it does, the whole {fmt_tokens(input_next)}-token context is written again ({fmt_cost(full_write)})"
+    if total.prefix_writes == 0:
+        return (f"{names}: whether Claude Code re-reads it mid-session, and where it sits in the prompt, "
+                f"is not in the transcripts, and your history has no such edit to measure; {worst}.")
+    return (f"{names}: in your history, {total.prefix_writes_then_break} of {total.prefix_writes} edits of such "
+            f"files during a session were followed by a cache break on the next call; {worst}.")
 
 
 def _files_warning(store: Store, session_key: str, main: list[Row], fam_hist, family) -> Optional[str]:
@@ -361,7 +409,9 @@ def _ago(seconds: float) -> str:
         return f"{int(seconds)} s"
     if seconds < 7200:
         return f"{int(seconds // 60)} min"
-    return f"{seconds / 3600:.1f} h"
+    if seconds < 172_800:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86_400:.1f} days"
 
 
 def render(est: dict[str, Any]) -> str:
@@ -369,6 +419,8 @@ def render(est: dict[str, Any]) -> str:
     out = [f"tokentrail estimate: session {est['session']} ({est['project']}), {est['model']}"]
     if est.get("session_chosen") == "latest":
         out.append("  no session was started in this directory: using your most recent one (--session to pick)")
+    out.append("")
+    out += est["certain"]
     out.append("")
     out.append("Computed (from the session's last real call)")
     out.append(f"  last call input            {c['last_call_input']:>12,}")
@@ -393,18 +445,9 @@ def render(est: dict[str, Any]) -> str:
     )
     out.append(f"  (text -> tokens at {c['chars_per_token']} chars/token, {cal}; no network tokenizer)")
     out.append("")
-    out.append(f"Predicted (p10-p90 of {p['basis']}; family '{p['family']}', {p['family_source']})")
-    if "turns" in p and p["turns"]:
-        out.append(f"  model calls                {_band(p['turns'], _n)}   (main thread {_band(p['turns_main'], _n)})")
-        out.append(f"  input over the task        {_band(p['input'], fmt_tokens)}")
-        out.append(f"  output over the task       {_band(p['output'], fmt_tokens)}")
-        if p.get("cost"):
-            out.append(f"  cost                       {_band(p['cost'], fmt_cost)}")
-    else:
-        out.append(
-            f"  no past task to compare with yet ({p['samples']} found). Predictions need history; "
-            "the floor and ceiling below hold regardless."
-        )
+    out.append(f"Unvalidated estimate: turns from {p['basis']} (family '{p['family']}', {p['family_source']})")
+    out += ["  " + line for line in turns_lines(p)]
+    out.append("  Not yet compared with outcomes: `tokentrail score` says how past estimates fared.")
     out.append("")
     ce = f["ceiling"]
     out.append("Frame")
@@ -422,11 +465,20 @@ def render(est: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
-def _band(b, fmt) -> str:
-    if not b:
-        return "?"
-    lo, hi = b
-    return f"{fmt(lo)} - {fmt(hi)}"
+def turns_lines(p: dict[str, Any]) -> list[str]:
+    """The turn estimate in words; no interval when the history is too spread to give one."""
+    t = p.get("turns")
+    if not t:
+        return [f"no past task to compare with yet ({p['samples']} found); the floor and ceiling below hold."]
+    if t["spread"]:
+        return [f"turns too spread to estimate: p10 {_n(t['p10'])}, median {_n(t['p50'])}, p90 {_n(t['p90'])} "
+                f"(x{t['ratio']:.0f}, two orders of magnitude or more); no interval given"]
+    out = [f"model calls (main thread)  {_n(t['p10'])} - {_n(t['p90'])}, median {_n(t['p50'])}"]
+    if p.get("cost"):
+        c = p["cost"]
+        out.append(f"cost of those turns        {fmt_cost(c['p10'])} - {fmt_cost(c['p90'])}, median {fmt_cost(c['p50'])}"
+                   "   (turns x context; output and sub-agents not included)")
+    return out
 
 
 def _n(x: float) -> str:

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import __version__, diagnose, estimate, live, paths, prices, report
+from . import __version__, diagnose, estimate, live, paths, predictions, prices, report
 from .analysis import parse_since
 from .classify import FAMILIES
 from .collectors import claude_code
@@ -24,7 +24,7 @@ ISSUES_HINT = "Nothing was changed. Run again with --debug to see details, and p
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tokentrail",
-        description="Where your Claude Code tokens go, and what a prompt will cost before you send it. "
+        description="Where your Claude Code tokens go, and what your next message is sure to cost before you send it. "
         "Reads local transcripts only; nothing leaves your machine.",
     )
     p.add_argument("--version", action="version", version=f"tokentrail {__version__}")
@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-ingest", action="store_true")
 
-    s = sub.add_parser("estimate", help="what the next prompt will cost, before sending it")
+    s = sub.add_parser("estimate", help="what the next message is sure to cost, plus an unvalidated turn estimate")
     s.add_argument("text", nargs="*", help="the prompt you are about to send (or use --file)")
     s.add_argument("--file", type=Path, help="read the prompt from a file ('-' for stdin)")
     s.add_argument("--add", type=Path, action="append", default=[], metavar="PATH",
@@ -64,7 +64,18 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--max-turns", type=int, help="turn limit, for the ceiling (default: your max for this family)")
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-ingest", action="store_true")
+    s.add_argument("--no-record", action="store_true",
+                   help="don't record this estimate for `tokentrail score` (it is recorded by default, numbers only)")
     s.add_argument("--now", help=argparse.SUPPRESS)  # fixed clock, for demos and tests
+
+    s = sub.add_parser("turns", help="how many turns a task takes, by family: p10, median, p90")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-ingest", action="store_true")
+
+    s = sub.add_parser("score", help="how past estimates compared with what happened")
+    s.add_argument("--last", type=int, default=50, help="score the last N estimates (default: 50)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-ingest", action="store_true")
 
     s = sub.add_parser("tag", help="declare a task's family (overrides the guess)")
     s.add_argument("task", help="task id or prefix, as shown by `report`")
@@ -263,6 +274,8 @@ def _run(args) -> int:
             )
 
         table = prices.load()
+        if args.cmd != "score":
+            predictions.settle(store, table)  # record outcomes before transcripts get cleaned up
         if args.cmd == "report":
             since = None if args.since == "all" else parse_since(args.since)
             until = parse_since(args.until) if args.until else None
@@ -297,7 +310,19 @@ def _run(args) -> int:
                 edits=tuple(args.edits),
                 now=datetime.fromisoformat(args.now) if args.now else None,
             ))
+            if not args.no_record:
+                predictions.record(store, est, "cli")
             print(json.dumps(est, indent=2, default=str) if args.json else estimate.render(est))
+            return 0
+
+        if args.cmd == "turns":
+            rep = predictions.build_turns(store, table)
+            print(json.dumps(rep, indent=2) if args.json else predictions.render_turns(rep))
+            return 0
+
+        if args.cmd == "score":
+            rep = predictions.build_score(store, table, last=args.last)
+            print(json.dumps(rep, indent=2) if args.json else predictions.render_score(rep))
             return 0
     return 0
 

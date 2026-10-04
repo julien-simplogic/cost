@@ -13,6 +13,9 @@ from .prices import PriceTable
 
 TTL_SECONDS = {"5m": 300, "1h": 3600}
 MIN_CACHEABLE = 4096  # below this a missing cache read is not worth flagging
+# Files Claude Code puts in, or builds, the start of the prompt.
+PREFIX_FILES = {"CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "settings.json", "settings.local.json"}
+SPREAD_LIMIT = 100  # p90 / p10 at or above this (two orders of magnitude): no interval is given
 
 
 def parse_ts(s: Optional[str]) -> Optional[datetime]:
@@ -151,6 +154,63 @@ def cache_events(main_rows: Sequence[Row], prices: PriceTable) -> list[CacheEven
     return events
 
 
+def is_prefix_file(path: str) -> bool:
+    p = path.replace("\\", "/")
+    return p.rsplit("/", 1)[-1] in PREFIX_FILES or "/.claude/" in f"/{p}"
+
+
+@dataclass
+class BreakCauses:
+    """What visibly happened before each cache break, and what followed each prefix-file edit.
+
+    Visible means: in the transcript. A file you edit in your own editor, an MCP
+    server that changes its tools, a Claude Code update between two calls: none
+    of these is written there, so they land in "no visible cause".
+    """
+
+    breaks: int = 0
+    model_switch: int = 0
+    prefix_file_written: int = 0
+    no_visible_cause: int = 0
+    break_cost: dict = field(default_factory=lambda: {"model_switch": 0.0, "prefix_file_written": 0.0,
+                                                      "no_visible_cause": 0.0})
+    prefix_writes: int = 0  # prefix files written by a tool, with a next call to look at
+    prefix_writes_then_break: int = 0  # ... followed by a break on that next call
+
+    def add(self, other: "BreakCauses") -> None:
+        for k in ("breaks", "model_switch", "prefix_file_written", "no_visible_cause",
+                  "prefix_writes", "prefix_writes_then_break"):
+            setattr(self, k, getattr(self, k) + getattr(other, k))
+        for k, v in other.break_cost.items():
+            self.break_cost[k] += v
+
+
+def break_causes(main_rows: Sequence[Row], file_events: Sequence, prices: PriceTable) -> BreakCauses:
+    """One session: attribute each cache break to what the transcript shows between two calls.
+
+    A tool call is logged with the call that issued it, so a file written "between"
+    calls N and N+1 carries a timestamp from N up to (not including) N+1.
+    """
+    out = BreakCauses()
+    breaks = {e.turn_id: e for e in cache_events(main_rows, prices) if e.kind == "break"}
+    writes = sorted((e["ts"] or "", e["path"]) for e in file_events
+                    if e["action"] == "write" and is_prefix_file(e["path"]))
+    for prev, cur in zip(main_rows, main_rows[1:]):
+        written = [p for ts, p in writes if prev.ts <= ts < cur.ts]
+        ev = breaks.get(cur.turn_id)
+        if written and prev.input_total >= MIN_CACHEABLE and not cur.extra.get("after_compaction"):
+            out.prefix_writes += 1
+            out.prefix_writes_then_break += int(ev is not None)
+        if ev is None:
+            continue
+        out.breaks += 1
+        cause = ("model_switch" if cur.model != prev.model
+                 else "prefix_file_written" if written else "no_visible_cause")
+        setattr(out, cause, getattr(out, cause) + 1)
+        out.break_cost[cause] += ev.extra_cost or 0
+    return out
+
+
 # ---------------------------------------------------------------- statistics
 
 
@@ -164,6 +224,26 @@ def percentile(values: Sequence[float], q: float) -> Optional[float]:
     k = (len(xs) - 1) * q / 100
     lo, hi = math.floor(k), math.ceil(k)
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def percentile_sorted(xs: Sequence[float], q: float) -> Optional[float]:
+    """percentile() on an already sorted list."""
+    if not xs:
+        return None
+    k = (len(xs) - 1) * q / 100
+    lo, hi = math.floor(k), math.ceil(k)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def distribution(values: Sequence[float]) -> Optional[dict]:
+    """p10, median, p90, and whether the spread is too wide to give an interval."""
+    if not values:
+        return None
+    xs = sorted(values)
+    p10, p50, p90 = (percentile_sorted(xs, q) for q in (10, 50, 90))
+    ratio = p90 / p10 if p10 else float("inf")  # type: ignore[operator]
+    return {"n": len(xs), "p10": p10, "p50": p50, "p90": p90, "ratio": ratio,
+            "spread": ratio >= SPREAD_LIMIT}
 
 
 @dataclass
@@ -186,11 +266,17 @@ class TaskStats:
     recovered: int = 0
     cost: float = 0.0
     unpriced: int = 0
+    first_cache_read: int = 0
     rows: list[Row] = field(default_factory=list)
 
     @property
     def turns(self) -> int:
         return self.turns_main + self.turns_sub
+
+    @property
+    def tracked(self) -> bool:
+        """Tied to a prompt of yours (records Claude Code logged outside any are not a task)."""
+        return not self.task_id.endswith(":untracked")
 
 
 def group_tasks(rows: Iterable[Row], tasks: dict) -> list[TaskStats]:
@@ -212,6 +298,7 @@ def group_tasks(rows: Iterable[Row], tasks: dict) -> list[TaskStats]:
         else:
             if t.turns_main == 0:
                 t.first_input = r.input_total
+                t.first_cache_read = r.cache_read
             t.turns_main += 1
         t.tokens += r.tokens
         t.output += r.output
