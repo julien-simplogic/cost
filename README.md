@@ -344,6 +344,30 @@ guess on 1,847 of 3,649 tasks. So `estimate` takes its turns from all your
 past tasks, and records the guessed family so `score` can keep checking. A
 family you declare (`--family`, or `tokentrail tag <task> <family>`) is used.
 
+**What else was measured** (`scripts/study.py`, read-only, on the author's
+3,916 finished tasks; every backtest estimates each task from earlier tasks
+only, with 95% intervals from resampling sessions):
+
+- *The p10-p90 interval is too wide:* it holds 89% of outcomes, not 80%.
+  p12.5-p87.5, chosen on the older half, narrows it from 29 to 25 turns on the
+  newer half, but holds 89% there too and leaves the interval score unchanged
+  (57.2 against 57.4).
+- *The longer a task has run, the longer it still runs.* Median turns still
+  ahead: 4 after 1 turn, 5 after 3, 7 after 5, 11 after 10 (p90 55).
+- *The first task of a session is the long one:* median 22 turns, p90 108
+  (146 sessions), against 4 to 7 for later ones. The previous task's turns
+  and the rank in the session improve the interval score (by 2.7 and 2.9, both
+  intervals below 0) but leave coverage at 86-87%, outside the 75-85% asked
+  for. Prompt length, files mentioned, slash command, project and model do
+  not improve it. Short follow-ups (19 tasks) and pasted errors (17) are too
+  rare to tell.
+- *Cost:* turns × context gives the best interval score of four methods
+  ($17.97, against $18.70 for quantiles of the cost itself and $32.46 for
+  cost scaled by the first input), with 78.5% coverage, but its median runs
+  low: about 0.76 times the actual cost, since output and sub-agents are left
+  out. Adding the context's growth per turn (median 277 tokens) changes
+  nothing.
+
 **What a CLAUDE.md edit costs is measured, not asserted.** Where Claude Code
 puts `CLAUDE.md` in the prompt, and whether it re-reads it mid-session, is not
 written in the transcripts, so tokentrail cannot say "the prefix breaks at
@@ -778,8 +802,12 @@ explained either. **Unverified hypothesis:** the prefix is kept warm by other
 requests from the same account that leave no transcript on this machine (a
 session on another computer, a cloud session, Claude Code's own background
 calls). The test above only saw local sessions, so it cannot rule this out.
-`scripts/study.py 8` lists what the transcripts show between two expiries
-whose block changed or stayed. tokentrail uses the measured median and does not depend on
+Between two expiries of one session the block stayed identical in 252 of
+316 pairs. When it changed (median 2,685 tokens), the transcript more often
+showed, in between, a change of the loaded tool list (`deferred_tools_delta`
+in 23 of 64 against 19 of 252), of instructions (20/64 against 14/252), of
+MCP instructions (13/64 against 9/252), of Claude Code version (15/64 against
+7/252). That fits the system prompt plus tools; it does not prove it. tokentrail uses the measured median and does not depend on
 the answer.
 
 **The cache breaks with no visible cause.** On the author's history, 169
