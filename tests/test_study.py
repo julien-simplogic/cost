@@ -117,3 +117,17 @@ def test_step5_compares_cost_methods_on_the_same_tasks(study, capsys):
     lines = [ln for ln in out.splitlines() if "coverage" in ln and "sessions" in ln]
     assert len(lines) == 4
     assert len({ln.split("n=")[1].split("(")[0] for ln in lines}) == 1  # same n for every method
+
+
+def test_step6_judges_signs_against_the_baseline_on_the_same_tasks(study, capsys):
+    tasks = study.load()
+    sg = study.signs(tasks)
+    pairs, _ = study.sliced_backtest(tasks, sg["error pasted"])
+    # every pair compares the same task; the baseline uses only earlier tasks
+    for t, base, _ in pairs:
+        earlier = sorted(x.turns for x in tasks[:tasks.index(t)])
+        assert base[1] == study.percentile_sorted(earlier, 50)
+    study.step6(tasks)
+    out = capsys.readouterr().out
+    assert "-- error pasted" in out and "interval score difference" in out
+    assert "signs that pass:" in out

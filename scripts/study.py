@@ -9,6 +9,7 @@ Steps (numbering of the 4 Oct 2026 plan):
   3  recalibration: which quantiles give 80% in a leak-free backtest
   4  turns still ahead once a task has made k turns
   5  cost rather than turns: context growth per turn, and which cost estimate does best
+  6  candidate signs, one at a time, then a shallow quantile tree if several pass
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import bisect
+from collections import Counter
 
 from tokentrail import metrics, paths, prices
 from tokentrail.analysis import enrich, group_tasks, parse_ts, percentile, percentile_sorted
@@ -379,7 +381,222 @@ def step5(tasks: list[T]) -> None:
     print("leave out output and sub-agents, as the tool does today.")
 
 
-STEPS = {"1": step1, "3": step3, "4": step4, "5": step5}
+# ------------------------------------------------------------------ step 6
+
+MIN_BIN = 30  # a slice with fewer earlier tasks than this falls back to all earlier tasks
+BUILTIN_COMMANDS = {"review", "compact", "init", "clear", "security-review", "pr-comments", "model", "cost",
+                    "help", "config", "memory", "resume", "context", "loop", "simplify", "code-review"}
+
+
+def _bucket(x: Optional[float], edges: list[tuple[float, str]]) -> Optional[str]:
+    if x is None:
+        return None
+    for limit, label in edges:
+        if x <= limit:
+            return label
+    return edges[-1][1]
+
+
+def signs(tasks: list[T]) -> dict[str, dict[str, str]]:
+    """sign -> task_id -> slice label, from what is known before the task's prompt is sent."""
+    prev: dict[str, Optional[T]] = {}
+    rank: dict[str, int] = {}
+    for ts in by_session(tasks).values():
+        for i, t in enumerate(ts):
+            prev[t.task_id] = ts[i - 1] if i else None
+            rank[t.task_id] = i + 1
+    top_projects = {p for p, _ in Counter(t.project for t in tasks).most_common(10)}
+    out: dict[str, dict[str, str]] = {k: {} for k in (
+        "previous task's turns", "short follow-up", "error pasted", "prompt length", "files mentioned",
+        "slash command", "project", "rank in session", "model")}
+    for t in tasks:
+        p = prev[t.task_id]
+        out["previous task's turns"][t.task_id] = "first of session" if p is None else _bucket(
+            p.turns, [(1, "1"), (3, "2-3"), (8, "4-8"), (20, "9-20"), (float("inf"), "21+")])
+        out["rank in session"][t.task_id] = _bucket(
+            rank[t.task_id], [(1, "1st"), (3, "2-3"), (10, "4-10"), (30, "11-30"), (float("inf"), "31+")])
+        out["project"][t.task_id] = ("project " + anon(t.project)) if t.project in top_projects else "other"
+        out["model"][t.task_id] = t.model
+        pr = t.prompt
+        if pr is None:
+            continue
+        out["short follow-up"][t.task_id] = "yes" if pr.followup else "no"
+        out["error pasted"][t.task_id] = "yes" if pr.error else "no"
+        out["prompt length"][t.task_id] = _bucket(
+            pr.chars, [(49, "<50 chars"), (199, "50-199"), (999, "200-999"), (float("inf"), "1000+")])
+        out["files mentioned"][t.task_id] = _bucket(pr.n_files, [(0, "0"), (1, "1"), (3, "2-3"), (float("inf"), "4+")])
+        c = pr.command
+        out["slash command"][t.task_id] = "none" if not c else (
+            "/" + c if c.split(":")[-1].lower() in BUILTIN_COMMANDS else "custom " + anon(c))
+    return out
+
+
+def sliced_backtest(tasks: list[T], label: dict[str, str]):
+    """Paired leak-free intervals on the tasks that have a slice: by slice (fallback: all earlier
+    tasks while the slice has fewer than MIN_BIN), and baseline (all earlier tasks)."""
+    seen_all: list[int] = []
+    seen: dict[str, list[int]] = {}
+    pairs = []
+    fallback = 0
+    for t in tasks:
+        lab = label.get(t.task_id)
+        if lab is not None and len(seen_all) >= MIN_HISTORY:
+            base = tuple(percentile_sorted(seen_all, q) for q in (10, 50, 90))
+            h = seen.get(lab, [])
+            if len(h) >= MIN_BIN:
+                mine = tuple(percentile_sorted(h, q) for q in (10, 50, 90))
+            else:
+                mine, fallback = base, fallback + 1
+            pairs.append((t, base, mine))
+        bisect.insort(seen_all, t.turns)
+        if lab is not None:
+            bisect.insort(seen.setdefault(lab, []), t.turns)
+    return pairs, fallback
+
+
+def paired_gain(pairs) -> tuple[Optional[float], Optional[tuple[float, float]]]:
+    """Mean interval score, slice minus baseline (negative = the sign helps), with its session CI."""
+    diffs = [(t.key, metrics.interval_score(m[0], t.turns, m[2]) - metrics.interval_score(b[0], t.turns, b[2]))
+             for t, b, m in pairs]
+    stat = lambda xs: metrics.mean([d for _, d in xs])  # noqa: E731
+    return stat(diffs), metrics.bootstrap_by_session(diffs, lambda x: x[0], stat, n=BOOT)
+
+
+def passes(pairs) -> bool:
+    gain, ci = paired_gain(pairs)
+    cov = metrics.coverage([(m[0], t.turns, m[2]) for t, _, m in pairs])
+    return bool(ci and ci[1] < 0 and cov is not None and 0.75 <= cov <= 0.85)
+
+
+def step6(tasks: list[T]) -> None:
+    print("=== Step 6: candidate signs, one at a time (target: main-thread turns of the task)")
+    print(f"Slices with fewer than {MIN_BIN} earlier tasks fall back to all earlier tasks. Criterion: interval")
+    print("score better than the baseline on the same tasks (95% session CI of the difference below 0)")
+    print("and coverage between 75% and 85%.")
+    sg = signs(tasks)
+    declared = [t for t in tasks if t.family_source == "declared"]
+    passed = []
+    for name, label in sg.items():
+        print(f"\n-- {name} ({len(label)} tasks with a value)")
+        groups: dict[str, list[int]] = {}
+        for t in tasks:
+            if t.task_id in label:
+                groups.setdefault(label[t.task_id], []).append(t.turns)
+        for lab, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:12]:
+            print("   " + dist(v, lab[:28]))
+        pairs, fb = sliced_backtest(tasks, label)
+        if not pairs:
+            continue
+        print("   " + score_line("baseline (all earlier)", [(t.key, b[0], t.turns, b[2], b[1]) for t, b, _ in pairs]))
+        print("   " + score_line("by this sign", [(t.key, m[0], t.turns, m[2], m[1]) for t, _, m in pairs]))
+        gain, ci = paired_gain(pairs)
+        ok = passes(pairs)
+        print(f"   interval score difference {gain:+.2f} [{ci[0]:+.2f}, {ci[1]:+.2f}]; fell back on {fb} tasks; "
+              f"{'PASSES' if ok else 'does not pass'}" if ci else f"   difference {gain}")
+        if ok:
+            passed.append(name)
+    if len(declared) >= MIN_BIN:
+        print(f"\n-- declared families ({len(declared)} tasks tagged): declared vs guessed on the same tasks")
+        guess = {t.task_id: t.family for t in tasks}
+        for lab in sorted({t.family for t in declared}):
+            mine = [t.turns for t in declared if t.family == lab]
+            print("   " + dist(mine, f"declared {lab}"))
+        print(f"   guessed family = declared on {sum(1 for t in declared if guess[t.task_id] == t.family)} "
+              f"of {len(declared)} (the guess is overwritten by the tag; agreement needs the raw guess, not kept)")
+    else:
+        print(f"\n-- declared families: {len(declared)} tasks tagged, fewer than {MIN_BIN}: not enough to compare")
+    print(f"\nsigns that pass: {', '.join(passed) or 'none'}")
+    if len(passed) >= 2:
+        quantile_tree(tasks, {n: sg[n] for n in passed})
+
+
+def pinball(ys: list[int], preds: tuple[float, float, float]) -> float:
+    tot = 0.0
+    for q, p in zip((0.1, 0.5, 0.9), preds):
+        for y in ys:
+            tot += max(q * (y - p), (q - 1) * (y - p))
+    return tot
+
+
+def _quantiles(ys) -> tuple[float, float, float]:
+    s = sorted(ys)
+    return tuple(percentile_sorted(s, q) for q in (10, 50, 90))  # type: ignore[return-value]
+
+
+def grow(ts: list[T], labels: dict[str, dict[str, str]], depth: int, path: tuple = ()):
+    """Greedy binary split minimizing pinball loss; slices of a sign ordered by their median."""
+    ys = [t.turns for t in ts]
+    leaf = {"path": path, "n": len(ts), "q": _quantiles(ys)}
+    if depth == 0:
+        return leaf
+    best = None
+    here = pinball(ys, leaf["q"])
+    for name, lab in labels.items():
+        groups: dict[str, list[T]] = {}
+        for t in ts:
+            groups.setdefault(lab.get(t.task_id, "?"), []).append(t)
+        order = sorted(groups, key=lambda g: percentile([t.turns for t in groups[g]], 50))
+        for cut in range(1, len(order)):
+            left = [t for g in order[:cut] for t in groups[g]]
+            right = [t for g in order[cut:] for t in groups[g]]
+            if len(left) < MIN_BIN or len(right) < MIN_BIN:
+                continue
+            loss = (pinball([t.turns for t in left], _quantiles([t.turns for t in left]))
+                    + pinball([t.turns for t in right], _quantiles([t.turns for t in right])))
+            if loss < here and (best is None or loss < best[0]):
+                best = (loss, name, set(order[:cut]), left, right)
+    if best is None:
+        return leaf
+    _, name, lefts, left, right = best
+    return {"sign": name, "left": lefts,
+            "yes": grow(left, labels, depth - 1, path + (f"{name} in {sorted(lefts)}",)),
+            "no": grow(right, labels, depth - 1, path + (f"{name} not in {sorted(lefts)}",))}
+
+
+def predict(node, t: T, labels):
+    while "sign" in node:
+        node = node["yes"] if labels[node["sign"]].get(t.task_id, "?") in node["left"] else node["no"]
+    return node
+
+
+def quantile_tree(tasks: list[T], labels: dict[str, dict[str, str]]) -> None:
+    print("\n-- shallow quantile tree on the signs that pass (trained on the oldest 70%, judged on the rest)")
+    cut = int(len(tasks) * 0.7)
+    train, test = tasks[:cut], tasks[cut:]
+    base_q = _quantiles([t.turns for t in train])
+    print("   " + score_line("baseline (all training tasks)",
+                             [(t.key, base_q[0], t.turns, base_q[2], base_q[1]) for t in test]))
+    for name, lab in labels.items():  # every passing sign alone, judged on the same held-out tasks
+        groups: dict[str, list[int]] = {}
+        for t in train:
+            groups.setdefault(lab.get(t.task_id, "?"), []).append(t.turns)
+        qmap = {g: _quantiles(v) for g, v in groups.items() if len(v) >= MIN_BIN}
+        items = []
+        for t in test:
+            q = qmap.get(lab.get(t.task_id, "?"), base_q)
+            items.append((t.key, q[0], t.turns, q[2], q[1]))
+        print("   " + score_line(f"alone: {name}"[:30], items))
+    for depth in (2, 3):
+        tree = grow(train, labels, depth)
+        items = []
+        for t in test:
+            leaf = predict(tree, t, labels)
+            items.append((t.key, leaf["q"][0], t.turns, leaf["q"][2], leaf["q"][1]))
+        print("   " + score_line(f"tree depth {depth}", items))
+    tree = grow(train, labels, 3)
+    print("   leaves of the depth-3 tree (each estimate reads: N past tasks like this one):")
+
+    def walk(n):
+        if "sign" in n:
+            walk(n["yes"])
+            walk(n["no"])
+        else:
+            print(f"     {n['n']:>5} tasks, p10 {n['q'][0]:.0f} / median {n['q'][1]:.0f} / p90 {n['q'][2]:.0f}: "
+                  + ("; ".join(n["path"]) or "all"))
+    walk(tree)
+
+
+STEPS = {"1": step1, "3": step3, "4": step4, "5": step5, "6": step6}
 
 
 def main(argv: list[str]) -> None:
