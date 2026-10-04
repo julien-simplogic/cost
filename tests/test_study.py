@@ -97,3 +97,13 @@ def test_step3_chooses_on_one_half_and_judges_on_the_other(study, capsys):
     out = capsys.readouterr().out
     assert "chosen on the first half" in out and "judged on the second half" in out
     assert "p10-p90 (today)" in out and "(recalibrated)" in out
+
+
+def test_step4_remaining_turns(study, capsys):
+    tasks = study.load()
+    study.step4(tasks)
+    out = capsys.readouterr().out
+    long3 = [t.turns - 3 for t in tasks if t.turns >= 3]
+    [line] = [ln for ln in out.splitlines() if ln.startswith("ahead after k=3")]
+    assert f"n={len(long3):>5}" in line
+    assert "leak-free backtest" in out and "k=0" in out

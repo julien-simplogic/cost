@@ -7,6 +7,7 @@ Prints numbers only; project names and MCP server names are replaced by hashes.
 Steps (numbering of the 4 Oct 2026 plan):
   1  task definition: short follow-ups merged into the previous task
   3  recalibration: which quantiles give 80% in a leak-free backtest
+  4  turns still ahead once a task has made k turns
 """
 
 from __future__ import annotations
@@ -283,7 +284,34 @@ def step3(tasks: list[T]) -> None:
     print("coverage moves in steps: an exact 80% may not exist.")
 
 
-STEPS = {"1": step1, "3": step3}
+# ------------------------------------------------------------------ step 4
+
+KS = (1, 2, 3, 5, 10)
+
+
+def step4(tasks: list[T]) -> None:
+    print("=== Step 4: turns still ahead once a task has made k main-thread turns")
+    print("Every task here is finished (a later task or an hour idle ends it), so nothing is censored:")
+    print("the empirical distribution is the Kaplan-Meier estimate itself, no correction needed.")
+    print(dist([t.turns for t in tasks], "total turns, k=0"))
+    for k in KS:
+        reached = [t for t in tasks if t.turns >= k]
+        if not reached:
+            continue
+        stop = sum(1 for t in reached if t.turns == k)
+        print(dist([t.turns - k for t in reached], f"ahead after k={k}")
+              + f"   ends at k: {100 * stop / len(reached):.0f}%")
+    print("If the median ahead grows with k, the longer a task has run, the longer it still runs.")
+    print("\nleak-free backtest (interval from earlier tasks that had also reached k):")
+    for k in (0,) + KS:
+        reached = [t for t in tasks if t.turns >= max(k, 1)]
+        rows = leak_free(reached, lambda t: t.turns - k)
+        if rows:
+            print(score_line(f"k={k}", [(t.key, v[0], t.turns - k, v[2], v[1]) for t, v in rows]))
+    print("Log error leaves out tasks that end exactly at k (0 turns ahead).")
+
+
+STEPS = {"1": step1, "3": step3, "4": step4}
 
 
 def main(argv: list[str]) -> None:
