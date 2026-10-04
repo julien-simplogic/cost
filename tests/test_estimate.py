@@ -233,3 +233,42 @@ def test_turns_come_from_tasks_at_the_same_place_in_their_session(env, store):
     assert p["rank_in_session"] == 2
     assert p["basis"] == "35 past tasks that were the 2nd or 3rd of their session"
     assert p["turns"]["p50"] == 2
+
+
+def test_turns_come_from_the_past_prompts_most_like_this_one(env, store):
+    from tokentrail import paths as _paths
+
+    import random
+
+    rng = random.Random(3)
+    vocab = [f"{a}{b}{c}" for a in "bcdfgklmnprst" for b in "aeiou" for c in "lmnrstx"]
+    s = FakeSession(env.projects, project="acme-webshop", start=T0)
+    for i in range(700):  # 32 ledger migrations took 12 turns; everything else, 1
+        if i % 22 == 0:
+            s.prompt(f"migrate the invoice ledger schema to postgres partitions, batch {i}")
+            n = 12
+        else:
+            s.prompt(" ".join(rng.sample(vocab, 6)))
+            n = 1
+        for _ in range(n):
+            s.call(read=20_000, write=100, out=100)
+        s.tick(60)
+    s.write()
+    cur = _current(env.projects)
+    p = _est(store, cur, text="migrate the payments ledger schema to postgres partitions",
+             transcripts=_paths.claude_code_dir())["predicted"]
+    assert p["basis_kind"] == "neighbours"
+    assert p["basis"] == "the 30 past prompts most like this one"
+    assert p["turns"]["p50"] == 12
+    # a declared family wins, and no text means no neighbours
+    assert _est(store, cur, text="", transcripts=_paths.claude_code_dir())["predicted"]["basis_kind"] != "neighbours"
+
+
+def test_neighbours_are_skipped_when_reading_takes_too_long(env, store):
+    from tokentrail import paths as _paths
+
+    _history(env.projects)
+    cur = _current(env.projects)
+    p = _est(store, cur, text="refactor something", transcripts=_paths.claude_code_dir(),
+             neighbour_budget_s=0.0)["predicted"]
+    assert p["basis_kind"] != "neighbours"

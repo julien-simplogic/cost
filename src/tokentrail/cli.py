@@ -309,6 +309,7 @@ def _run(args) -> int:
                 model=args.model, max_tokens=args.max_tokens, max_turns=args.max_turns,
                 edits=tuple(args.edits),
                 now=datetime.fromisoformat(args.now) if args.now else None,
+                transcripts=args.source_dir or paths.claude_code_dir(),
             ))
             if not args.no_record:
                 predictions.record(store, est, "cli")

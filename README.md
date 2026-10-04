@@ -312,10 +312,12 @@ Three kinds of numbers, never mixed:
 - **Unvalidated estimate.** The one real unknown is how many turns the task
   will take. tokentrail does not try to predict output (on the author's
   history, input is 99.8% of tokens and is computed; output is 0.24%). It takes
-  the 12.5th, 50th and 87.5th percentiles of main-thread turns over your past
-  tasks that were at the same place in their session (the first task of a
-  session runs far longer than the next ones), never a mean, and multiplies by
-  the context size. That pair, not
+  the 12.5th, 50th and 87.5th percentiles of main-thread turns, never a
+  mean, and multiplies by the context size. The past tasks it takes them
+  from, first match wins: those of a family you declared; else the 30 past
+  prompts most alike to yours in words, when 30 are close enough (the best
+  sign found, see below); else past tasks at the same place in their session
+  (the first task of a session runs far longer than the next ones); else all. That pair, not
   p10-p90, is the one that held about 80% of outcomes in a backtest (below).
   When turns spread over two orders of magnitude (high bound ≥ 100 × low),
   it says so and gives no interval: one that wide covers everything and says
@@ -767,7 +769,10 @@ tests (`tests/test_privacy.py`), run in CI on every push:
 
 tokentrail writes to `$TOKENTRAIL_HOME`, or by default to
 `~/.local/share/tokentrail` (`%LOCALAPPDATA%\tokentrail` on Windows). Prompt
-text is never stored, only its length; recorded estimates hold numbers only,
+text is never stored, only its length. To find your past prompts most alike
+to the one you are about to send, `estimate` and the hook re-read them from
+the transcripts in memory each time and keep nothing (the hook gives up after
+4 seconds and estimates without them); recorded estimates hold numbers only,
 and a test checks that a prompt's words are not in the database.
 
 ## What v0 does not see: cloud sessions

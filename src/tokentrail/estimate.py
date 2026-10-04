@@ -58,6 +58,8 @@ class EstimateInput:
     edits: tuple[str, ...] = ()  # files you are about to change
     cwd: Optional[str] = None
     now: Optional[datetime] = None
+    transcripts: Optional[Path] = None  # where past prompts are read from (default: Claude Code's)
+    neighbour_budget_s: Optional[float] = None  # the hook gives up on neighbours past this
 
 
 def guess_family_from_text(text: str) -> Optional[str]:
@@ -180,6 +182,15 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     rank_next = sum(1 for t in all_tasks if t.session_key == session_key) + 1
     slice_next = rank_slice(rank_next)
     rank_hist = [t for t in hist if rank_slice(ranks[t.task_id]) == slice_next]
+    near_hist: list = []
+    if inp.text.strip() and not inp.family:
+        from . import paths, similar
+
+        docs = similar.prompt_words(inp.transcripts or paths.claude_code_dir(), inp.neighbour_budget_s)
+        if docs:
+            by_id = {t.task_id: t for t in hist}
+            ids = similar.nearest(similar.words(inp.text), {i: w for i, w in docs.items() if i in by_id})
+            near_hist = [by_id[i] for i in ids]
     # A family guessed from your text is recorded (score checks it) but not used as the
     # basis: on real history, text-guessed families did not separate turns (all medians 4-5,
     # except 'review' at 11 with p10-p90 2-57). A family you declare is used.
@@ -188,6 +199,10 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
     elif inp.family:
         basis, basis_label = hist, (f"all {len(hist)} past tasks ('{family}' has only {len(fam_hist)}, "
                                     f"need {MIN_FAMILY_SAMPLES})")
+    elif near_hist:
+        # Your past prompts most alike in words (read in memory, nothing kept): on real history
+        # the best sign before sending, where 30 close enough exist (scripts/study.py 9b).
+        basis, basis_label = near_hist, f"the {len(near_hist)} past prompts most like this one"
     elif len(rank_hist) >= MIN_RANK_SAMPLES:
         # The one sign that held up in the leak-free backtest (scripts/study.py 6): where the
         # task falls in its session. The first one is the long one (median 22 turns, against
@@ -289,6 +304,8 @@ def build(store: Store, prices: PriceTable, inp: EstimateInput) -> dict[str, Any
         "predicted": {
             "validated": False,
             "rank_in_session": rank_next,
+            "basis_kind": ("family" if basis is fam_hist else "neighbours" if basis is near_hist
+                           else "rank" if basis is rank_hist else "all"),
             "family": family,
             "family_source": family_source,
             "basis": basis_label,

@@ -238,6 +238,9 @@ def _obj(d: Any, key: str) -> dict:
 # ------------------------------------------------------------------ prompt hook
 
 
+HOOK_NEIGHBOUR_BUDGET_S = 4.0  # reading past prompts must not hold up yours: past this, no neighbours
+
+
 def prompt_hook(raw_stdin: str) -> Optional[str]:
     """JSON to print for Claude Code, or None to print nothing."""
     data = _read_stdin_json(raw_stdin)
@@ -254,6 +257,8 @@ def prompt_hook(raw_stdin: str) -> Optional[str]:
                 text=prompt if isinstance(prompt, str) else "",
                 session=sf.session_id,
                 cwd=data.get("cwd") if isinstance(data.get("cwd"), str) else None,
+                transcripts=Path(tp).parent.parent,
+                neighbour_budget_s=HOOK_NEIGHBOUR_BUDGET_S,
             ))
         except TokentrailError:
             return None  # first prompt of a session: nothing to start from yet
@@ -269,8 +274,7 @@ def hook_message(est: dict[str, Any]) -> str:
     p = est["predicted"]
     lines = ["tokentrail: " + " ".join(est["certain"])]
     if p.get("turns"):
-        basis = f"{p['samples']} past '{p['family']}' tasks" if p.get("basis_is_family") else (
-            f"all {p['samples']} past tasks")
+        basis = p["basis"]
         t, c = p["turns"], p.get("cost")
         if t["spread"]:
             lines.append(f"  turns too spread to estimate ({basis}): p{t['q'][0]:g} {t['lo']:.0f}, "

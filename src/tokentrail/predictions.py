@@ -46,6 +46,7 @@ def record(store: Store, est: dict[str, Any], origin: str) -> int:
         "family": p["family"],
         "family_source": p["family_source"],
         "basis_is_family": p["basis_is_family"],
+        "basis_kind": p.get("basis_kind"),
         "samples": p["samples"],
         "turns": p["turns"],
         "cost": p["cost"],
