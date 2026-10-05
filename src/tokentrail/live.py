@@ -124,8 +124,13 @@ def statusline(raw_stdin: str, now: Optional[datetime] = None) -> str:
             alerts.append("cache missed on the last call")
     if res.checks and not totals_match(res.checks):
         alerts.append("totals disagree with Claude Code's counter: run tokentrail check")
-    if res.stats.not_understood:
-        alerts.append(f"{res.stats.not_understood} lines unread: run tokentrail check")
+    # Record types this version does not know are common (titles, file history...) and carry no
+    # tokens: no alert for those. Alert when an unknown record has token fields, or a line is
+    # broken (a last line cut mid-write is normal while Claude Code is writing).
+    risky = sum(res.stats.unknown_with_tokens.values()) + sum(
+        n for k, n in res.stats.unreadable.items() if k != "truncated_last_line")
+    if risky:
+        alerts.append(f"{risky} unread lines may hold tokens: run tokentrail check")
     if unpriced:
         alerts.append(f"{unpriced} calls unpriced: model missing from the price file")
     return " | ".join(parts + [f"! {a}" for a in alerts])

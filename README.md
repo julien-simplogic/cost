@@ -529,7 +529,8 @@ diagnostics, when present, take precedence.
 The cache alerts use Claude Code's own `prompt_cache` diagnostics when they are
 present; on older versions tokentrail spots a miss itself. The other alerts are
 a mismatch with Claude Code's counter, transcript lines tokentrail could not
-read, and a model missing from the price file. The status line reads only the
+read that may hold tokens (record types it does not know but that carry no token fields,
+like titles or file history, raise nothing), and a model missing from the price file. The status line reads only the
 session's transcript, so it needs no history; on a 1.3 MB session it takes
 about 0.15 s.
 

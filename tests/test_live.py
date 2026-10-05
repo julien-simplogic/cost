@@ -278,3 +278,18 @@ def test_setup_snippet_adds_the_stop_hook():
     snippet = json.loads(live.setup_snippet("/opt/tt"))
     [group] = snippet["hooks"]["Stop"]
     assert group["hooks"][0]["command"] == "/opt/tt hook stop"
+
+
+def test_unknown_records_without_tokens_raise_no_alert(env):
+    from tokentrail import live
+
+    tp, s = _session(env)
+    with tp.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "ai-title", "title": "x", "sessionId": s.session_id}) + "\n")
+        fh.write(json.dumps({"type": "frame-link", "sessionId": s.session_id}) + "\n")
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}))
+    assert "unread" not in line
+    with tp.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "new-usage-kind", "usage": {"input_tokens": 5000, "output_tokens": 10}}) + "\n")
+    line = live.statusline(json.dumps({"transcript_path": str(tp)}))
+    assert "! 1 unread lines may hold tokens: run tokentrail check" in line
