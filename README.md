@@ -481,7 +481,11 @@ which the estimate cannot know, and is labelled optimistic.
 tokentrail setup        # prints the lines to add to ~/.claude/settings.json; edits nothing
 ```
 
-**Status line.** Claude Code runs it after each reply. It shows what changes
+**Status line.** Claude Code runs it after each reply. It is drawn in the
+terminal only: the desktop app, the VS Code and JetBrains extensions and the
+web do not show a status line (code.claude.com/docs/en/statusline). There,
+the **stop hook** (`tokentrail hook stop`, also in `setup`) shows the same
+line as a message after each reply, since hooks run everywhere. It shows what changes
 and what you can act on; anything that is merely reassuring stays in
 `tokentrail check`.
 

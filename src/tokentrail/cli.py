@@ -88,7 +88,8 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("statusline", help="Claude Code status line (reads Claude Code's JSON on stdin)")
     s = sub.add_parser("hook", help="Claude Code hooks (read Claude Code's JSON on stdin)")
-    s.add_argument("event", choices=["prompt"], help="prompt: UserPromptSubmit")
+    s.add_argument("event", choices=["prompt", "stop"],
+                   help="prompt: UserPromptSubmit (before a prompt); stop: Stop (after each reply)")
     sub.add_parser("setup", help="print the settings.json lines that turn on the live display")
     s = sub.add_parser("diagnose", help="one session vs Claude Code's counter, numbers only (safe to paste)")
     s.add_argument("session", help="session id or prefix (the hashed ids of `report --anonymize` work too)")
@@ -205,7 +206,8 @@ def _run(args) -> int:
     if args.cmd == "hook":
         # never block or slow down a prompt, never write to the model's context
         try:
-            out = live.prompt_hook(_claude_code_stdin())
+            raw = _claude_code_stdin()
+            out = live.prompt_hook(raw) if args.event == "prompt" else live.stop_hook(raw)
         except Exception:  # noqa: BLE001
             if args.debug:
                 raise
@@ -221,8 +223,10 @@ def _run(args) -> int:
     if args.cmd == "setup":
         print(f"Add this to {live.where_settings()} (merge with what is already there):\n")
         print(live.setup_snippet())
-        print("\nThe status line runs after each reply; the hook runs when you send a prompt and shows")
-        print("its estimate to you only (systemMessage): nothing is added to the model's context.")
+        print("\nThe status line runs after each reply, in the terminal only. The prompt hook runs when you")
+        print("send a prompt; the stop hook runs after each reply and shows the status line's content in")
+        print("the places that draw no status line (desktop app, VS Code, JetBrains, web). Both hooks speak")
+        print("to you only (systemMessage): nothing is added to the model's context.")
         print("tokentrail never edits that file itself: it writes only to its own data directory.")
         return 0
 

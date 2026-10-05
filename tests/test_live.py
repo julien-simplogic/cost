@@ -256,3 +256,25 @@ def test_statusline_at_three_turns_counts_the_shell_commands_they_ran(env):
     tp = q.write()
     line = live.statusline(json.dumps({"transcript_path": str(tp)}), now=q.now + timedelta(seconds=10))
     assert "| turn 3, est. 1 more (" in line  # only the 35 short ones: 4 - 3
+
+
+def test_stop_hook_shows_the_status_line_wherever_hooks_run(env, capsys, monkeypatch):
+    tp, s = _session(env)
+    _feed(monkeypatch, {"transcript_path": str(tp), "hook_event_name": "Stop", "stop_hook_active": False})
+    assert main(["hook", "stop"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    # only a message to the user: no decision, so the reply is neither blocked nor continued
+    assert set(out) == {"systemMessage"}
+    assert out["systemMessage"].startswith("tokentrail: ctx ") and " at API rates" in out["systemMessage"]
+    for payload in ("garbage", {"transcript_path": "/nowhere.jsonl"}):
+        _feed(monkeypatch, payload)
+        assert main(["hook", "stop"]) == 0
+        assert capsys.readouterr().out == ""
+
+
+def test_setup_snippet_adds_the_stop_hook():
+    from tokentrail import live
+
+    snippet = json.loads(live.setup_snippet("/opt/tt"))
+    [group] = snippet["hooks"]["Stop"]
+    assert group["hooks"][0]["command"] == "/opt/tt hook stop"

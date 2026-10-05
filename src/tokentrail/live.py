@@ -305,15 +305,36 @@ def executable() -> str:
     return found or "tokentrail"
 
 
+def stop_hook(raw_stdin: str) -> Optional[str]:
+    """After each reply: the status line's content as a message to the user, for the places
+    that do not draw a status line (desktop app, IDE extensions, web) but do run hooks.
+    systemMessage only: nothing reaches the model, and the reply is never held or continued."""
+    data = _read_stdin_json(raw_stdin)
+    tp = data.get("transcript_path")
+    if not isinstance(tp, str) or not Path(tp).is_file():
+        return None
+    line = statusline(raw_stdin)
+    if line.startswith("tokentrail:"):  # nothing to say yet, or something failed
+        return None
+    return json.dumps({"systemMessage": "tokentrail: " + line})
+
+
 def setup_snippet(exe: str = "") -> str:
     exe = exe or executable()
     if " " in exe:
         exe = f'"{exe}"'
     return json.dumps({
         "statusLine": {"type": "command", "command": f"{exe} statusline"},
-        "hooks": {"UserPromptSubmit": [
-            {"hooks": [{"type": "command", "command": f"{exe} hook prompt", "timeout": 10}]}
-        ]},
+        "hooks": {
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": f"{exe} hook prompt", "timeout": 10}]}
+            ],
+            # the status line only shows in the terminal; this shows the same line after each
+            # reply wherever hooks run (desktop app, VS Code, JetBrains, web)
+            "Stop": [
+                {"hooks": [{"type": "command", "command": f"{exe} hook stop", "timeout": 10}]}
+            ],
+        },
     }, indent=2)
 
 
